@@ -111,11 +111,12 @@ WSGI_APPLICATION = 'budgetlybck.wsgi.application'
 
 DATABASES = {
     "default": {
-        "NAME": os.getenv('budgetly_bck'),
-        "USER": os.getenv('budgetly', ),
-        "PASSWORD": os.getenv('Budgetly2026!'),
-        "HOST": os.getenv('mysql-budgetly.alwaysdata.net'),
-        "PORT": os.getenv('3306'),
+        "ENGINE": os.getenv("DJANGO_DB_ENGINE", "django.db.backends.mysql"),
+        "NAME": os.getenv("DJANGO_DB_NAME"),
+        "USER": os.getenv("DJANGO_DB_USER"),
+        "PASSWORD": os.getenv("DJANGO_DB_PASSWORD"),
+        "HOST": os.getenv("DJANGO_DB_HOST"),
+        "PORT": os.getenv("DJANGO_DB_PORT", "3306"),
     }
 }
 
