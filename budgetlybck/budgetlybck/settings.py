@@ -71,6 +71,7 @@ INSTALLED_APPS = [
     'savings',
     'dashboard',
     'exchange_rates',
+    'feedback',
 ]
 
 AUTH_USER_MODEL = 'accounts.User'
@@ -172,6 +173,10 @@ REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
+REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'] = {
+    'feedback': os.getenv('DJANGO_FEEDBACK_THROTTLE_RATE', '5/hour'),
+}
+
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
@@ -180,14 +185,24 @@ SIMPLE_JWT = {
 
 EMAIL_BACKEND = os.getenv(
     'DJANGO_EMAIL_BACKEND',
-    'django.core.mail.backends.console.EmailBackend',
+    'django.core.mail.backends.smtp.EmailBackend',
 )
 EMAIL_HOST = os.getenv('DJANGO_EMAIL_HOST', '')
 EMAIL_PORT = int(os.getenv('DJANGO_EMAIL_PORT', '587'))
 EMAIL_HOST_USER = os.getenv('DJANGO_EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.getenv('DJANGO_EMAIL_HOST_PASSWORD', '')
-EMAIL_USE_TLS = env_bool('DJANGO_EMAIL_USE_TLS', True)
+EMAIL_USE_SSL = env_bool('DJANGO_EMAIL_USE_SSL', False)
+# Django does not permit SSL and STARTTLS together. SSL wins if both are set.
+EMAIL_USE_TLS = env_bool('DJANGO_EMAIL_USE_TLS', True) and not EMAIL_USE_SSL
 DEFAULT_FROM_EMAIL = os.getenv('DJANGO_DEFAULT_FROM_EMAIL', 'webmaster@localhost')
+
+# The client declares consent but cannot select which policy version is stored.
+LEGAL_POLICY_VERSION = os.getenv('DJANGO_LEGAL_POLICY_VERSION', '1.0')
+
+# The password-reset view appends the encoded user id and token to this route.
+FRONTEND_PASSWORD_RESET_URL = os.getenv(
+    'DJANGO_FRONTEND_PASSWORD_RESET_URL', 'http://localhost:5173/reset-password'
+)
 
 if not DEBUG:
     SECURE_SSL_REDIRECT = env_bool('DJANGO_SECURE_SSL_REDIRECT', True)

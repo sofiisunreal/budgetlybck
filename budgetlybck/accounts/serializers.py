@@ -1,4 +1,6 @@
 from django.contrib.auth import get_user_model
+from django.conf import settings
+from django.utils import timezone
 from rest_framework import serializers
 
 
@@ -14,6 +16,9 @@ class RegisterSerializer(serializers.ModelSerializer):
     password_confirm = serializers.CharField(
         write_only=True
     )
+    age_eligibility = serializers.BooleanField(write_only=True, required=True)
+    accept_terms = serializers.BooleanField(write_only=True, required=True)
+    accept_privacy_policy = serializers.BooleanField(write_only=True, required=True)
 
     class Meta:
         model = User
@@ -22,6 +27,9 @@ class RegisterSerializer(serializers.ModelSerializer):
             'email',
             'password',
             'password_confirm',
+            'age_eligibility',
+            'accept_terms',
+            'accept_privacy_policy',
             'first_name',
             'last_name',
         ]
@@ -32,10 +40,26 @@ class RegisterSerializer(serializers.ModelSerializer):
                 'password': 'Passwords do not match.'
             })
 
+        declarations = {
+            'age_eligibility': 'You must confirm that you are 18 years of age or older.',
+            'accept_terms': 'You must accept the Terms of Service.',
+            'accept_privacy_policy': 'You must accept the Privacy Policy.',
+        }
+        errors = {
+            field: message for field, message in declarations.items()
+            if data.get(field) is not True
+        }
+        if errors:
+            raise serializers.ValidationError(errors)
+
         return data
 
     def create(self, validated_data):
         validated_data.pop('password_confirm')
+        validated_data.pop('age_eligibility')
+        validated_data.pop('accept_terms')
+        validated_data.pop('accept_privacy_policy')
+        accepted_at = timezone.now()
 
         user = User.objects.create_user(
             username=validated_data['username'],
@@ -43,6 +67,10 @@ class RegisterSerializer(serializers.ModelSerializer):
             password=validated_data['password'],
             first_name=validated_data.get('first_name', ''),
             last_name=validated_data.get('last_name', ''),
+            age_eligibility_confirmed=True,
+            terms_accepted_at=accepted_at,
+            privacy_policy_accepted_at=accepted_at,
+            accepted_policy_version=settings.LEGAL_POLICY_VERSION,
         )
 
         return user

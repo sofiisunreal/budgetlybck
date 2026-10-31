@@ -12,6 +12,7 @@ from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from django.core.mail import send_mail
 from django.utils.http import urlsafe_base64_decode
+from django.conf import settings
 
 User = get_user_model()
 
@@ -88,21 +89,19 @@ class ForgotPasswordView(generics.GenericAPIView):
         serializer.is_valid(raise_exception=True)
 
         email = serializer.validated_data['email']
+        generic_response = {
+            'message': 'If an account exists for this email, password reset instructions have been sent.'
+        }
 
         try:
             user = User.objects.get(email=email)
 
         except User.DoesNotExist:
-            return Response(
-                {'error': 'No account found with this email address.'},
-                status=404
-            )
+            return Response(generic_response, status=200)
 
         uid = urlsafe_base64_encode(force_bytes(user.pk))
         token = default_token_generator.make_token(user)
-        reset_link = (
-            f'http://localhost:5173/reset-password/{uid}/{token}/'
-        )
+        reset_link = f'{settings.FRONTEND_PASSWORD_RESET_URL.rstrip("/")}/{uid}/{token}/'
         send_mail(
             subject='Reset your Budgetly password',
             message=(
@@ -115,12 +114,7 @@ class ForgotPasswordView(generics.GenericAPIView):
             recipient_list=[user.email],
         )
 
-        return Response(
-            {
-                'message': 'Password reset instructions have been sent.'
-            },
-            status=200
-        )
+        return Response(generic_response, status=200)
 
 class ResetPasswordView(generics.GenericAPIView):
     serializer_class = ResetPasswordSerializer
