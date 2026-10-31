@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.apps import apps
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -220,6 +221,37 @@ class FinancialApiTests(APITestCase):
         _, snapshot = build_schedule(loan, [repayment], as_of_date=date(2026, 1, 11))
         self.assertEqual((repayment.principal_amount, repayment.interest_amount, loan.remaining_amount), (Decimal('40.00'), Decimal('0.00'), Decimal('60.00')))
         self.assertEqual((snapshot['accrued_interest'], snapshot['total_outstanding']), (Decimal('0.00'), Decimal('60.00')))
+
+    def test_v2_daily_percentage_and_fixed_total_allocate_interest_first(self):
+        daily = self.client.post('/api/loans/', {'loan_type': 'borrowed', 'person_name': 'Amina', 'original_amount': '100.00', 'interest_method': 'daily_percentage', 'periodic_interest_rate': '1.0000', 'currency': 'KES', 'account': self.account.id, 'loan_date': '2026-01-01'}, format='json')
+        payment = self.client.post('/api/loan-repayments/', {'loan': daily.data['id'], 'account': self.account.id, 'amount': '10.00', 'repayment_date': '2026-01-03'}, format='json')
+        self.assertEqual((payment.data['interest_amount'], payment.data['principal_amount']), ('1.00', '9.00'))
+        fixed = self.client.post('/api/loans/', {'loan_type': 'lent', 'person_name': 'Brian', 'original_amount': '100.00', 'interest_method': 'fixed_total', 'fixed_interest_amount': '20.00', 'currency': 'KES', 'account': self.account.id, 'loan_date': '2026-01-01'}, format='json')
+        payment = self.client.post('/api/loan-repayments/', {'loan': fixed.data['id'], 'account': self.account.id, 'amount': '20.00', 'repayment_date': '2026-01-02'}, format='json')
+        self.assertEqual((payment.data['interest_amount'], payment.data['principal_amount']), ('20.00', '0.00'))
+
+    def test_v2_fixed_recurring_proportional_and_method_validation(self):
+        invalid = self.client.post('/api/loans/', {'loan_type': 'borrowed', 'person_name': 'Amina', 'original_amount': '100.00', 'interest_method': 'fixed_daily', 'currency': 'KES', 'account': self.account.id, 'loan_date': '2026-01-01'}, format='json')
+        self.assertEqual(invalid.status_code, status.HTTP_400_BAD_REQUEST)
+        loan = Loan.objects.create(user=self.user, loan_type='lent', person_name='Amina', original_amount=Decimal('100.00'), interest_method='fixed_daily', fixed_interest_amount=Decimal('10.00'), fixed_charge_behavior='proportional_to_principal', interest_enabled=True, currency='KES', account=self.account, loan_date=date(2026, 1, 1))
+        repayment = LoanRepayment(loan=loan, account=self.account, amount=Decimal('50.00'), repayment_date=date(2026, 1, 3), created_at=timezone.now())
+        allocations, snapshot = build_schedule(loan, [repayment], as_of_date=date(2026, 1, 4))
+        self.assertEqual((allocations[None]['interest_amount'], allocations[None]['principal_amount']), (Decimal('10.00'), Decimal('40.00')))
+        self.assertEqual(snapshot['accrued_interest'], Decimal('6.00'))
+
+    def test_v2_weekly_boundaries_and_month_end_anniversaries(self):
+        weekly = Loan.objects.create(user=self.user, loan_type='lent', person_name='Amina', original_amount=Decimal('100.00'), interest_method='weekly_percentage', periodic_interest_rate=Decimal('1.0000'), interest_enabled=True, currency='KES', account=self.account, loan_date=date(2026, 1, 1))
+        self.assertEqual(build_schedule(weekly, [], as_of_date=date(2026, 1, 8))[1]['accrued_interest'], Decimal('0.00'))
+        self.assertEqual(build_schedule(weekly, [], as_of_date=date(2026, 1, 9))[1]['accrued_interest'], Decimal('1.00'))
+        monthly = Loan.objects.create(user=self.user, loan_type='lent', person_name='Brian', original_amount=Decimal('100.00'), interest_method='monthly_percentage', periodic_interest_rate=Decimal('1.0000'), interest_enabled=True, currency='KES', account=self.account, loan_date=date(2024, 1, 31))
+        self.assertEqual(build_schedule(monthly, [], as_of_date=date(2024, 4, 2))[1]['accrued_interest'], Decimal('2.00'))
+
+    def test_v2_principal_zero_stops_recurring_charges_but_interest_remains_payable(self):
+        loan = Loan.objects.create(user=self.user, loan_type='lent', person_name='Amina', original_amount=Decimal('100.00'), interest_method='fixed_total', fixed_interest_amount=Decimal('20.00'), interest_enabled=True, currency='KES', account=self.account, loan_date=date(2026, 1, 1))
+        interest_payment = LoanRepayment(loan=loan, account=self.account, amount=Decimal('20.00'), repayment_date=date(2026, 1, 2), created_at=timezone.now())
+        principal_payment = LoanRepayment(loan=loan, account=self.account, amount=Decimal('100.00'), repayment_date=date(2026, 1, 3), created_at=timezone.now())
+        _, snapshot = build_schedule(loan, [interest_payment, principal_payment], as_of_date=date(2026, 2, 1))
+        self.assertEqual((snapshot['outstanding_principal'], snapshot['accrued_interest'], snapshot['total_outstanding']), (Decimal('0.00'), Decimal('0.00'), Decimal('0.00')))
 
     def test_budget_spending_uses_only_expense_transactions(self):
         self.client.post('/api/transactions/', self.transaction_payload(category=self.expense.id, transaction_type='expense', amount='120.00'), format='json')

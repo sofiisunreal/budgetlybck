@@ -177,12 +177,18 @@ class Transfer(models.Model):
 class Loan(models.Model):
     LOAN_TYPES = [('borrowed', 'Borrowed'), ('lent', 'Lent')]
     STATUSES = [('active', 'Active'), ('partially_paid', 'Partially paid'), ('settled', 'Settled')]
+    INTEREST_METHODS = [('none', 'No interest'), ('annual_percentage', 'Annual percentage'), ('daily_percentage', 'Daily percentage'), ('weekly_percentage', 'Weekly percentage'), ('monthly_percentage', 'Monthly percentage'), ('fixed_daily', 'Fixed daily'), ('fixed_weekly', 'Fixed weekly'), ('fixed_monthly', 'Fixed monthly'), ('fixed_total', 'Fixed total')]
+    FIXED_CHARGE_BEHAVIORS = [('full_until_settled', 'Full until settled'), ('proportional_to_principal', 'Proportional to principal')]
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='loans')
     loan_type = models.CharField(max_length=10, choices=LOAN_TYPES)
     person_name = models.CharField(max_length=150)
     original_amount = models.DecimalField(max_digits=14, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
     annual_interest_rate = models.DecimalField(max_digits=7, decimal_places=4, default=Decimal('0.0000'), validators=[MinValueValidator(Decimal('0'))])
+    interest_method = models.CharField(max_length=24, choices=INTEREST_METHODS, default='none')
+    periodic_interest_rate = models.DecimalField(max_digits=9, decimal_places=4, null=True, blank=True, validators=[MinValueValidator(Decimal('0'))])
+    fixed_interest_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(Decimal('0'))])
+    fixed_charge_behavior = models.CharField(max_length=28, choices=FIXED_CHARGE_BEHAVIORS, default='full_until_settled')
     # Marks loans created with explicit v1 interest terms. Legacy loans stay
     # interest-free and cannot be retroactively switched to interest-bearing.
     interest_enabled = models.BooleanField(default=False)

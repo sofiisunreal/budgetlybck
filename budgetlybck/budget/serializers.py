@@ -322,7 +322,7 @@ class LoanSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Loan
-        fields = ['id', 'loan_type', 'person_name', 'original_amount', 'annual_interest_rate', 'currency', 'account', 'account_detail', 'loan_date', 'due_date', 'description', 'status', 'remaining_amount', 'outstanding_principal', 'accrued_interest', 'total_outstanding', 'interest_as_of_date', 'repayments', 'created_at']
+        fields = ['id', 'loan_type', 'person_name', 'original_amount', 'interest_method', 'annual_interest_rate', 'periodic_interest_rate', 'fixed_interest_amount', 'fixed_charge_behavior', 'currency', 'account', 'account_detail', 'loan_date', 'due_date', 'description', 'status', 'remaining_amount', 'outstanding_principal', 'accrued_interest', 'total_outstanding', 'interest_as_of_date', 'repayments', 'created_at']
         read_only_fields = ['id', 'status', 'remaining_amount', 'outstanding_principal', 'accrued_interest', 'total_outstanding', 'interest_as_of_date', 'repayments', 'created_at']
 
     def validate(self, attrs):
@@ -342,15 +342,33 @@ class LoanSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     'original_amount': 'Original amount cannot be less than recorded repayments.'
                 })
-            financial_fields = ('annual_interest_rate', 'original_amount', 'loan_date', 'currency', 'loan_type')
+            financial_fields = ('interest_method', 'annual_interest_rate', 'periodic_interest_rate', 'fixed_interest_amount', 'fixed_charge_behavior', 'original_amount', 'loan_date', 'currency', 'loan_type')
             if self.instance.repayments.exists() and any(field in attrs and attrs[field] != getattr(self.instance, field) for field in financial_fields):
                 raise serializers.ValidationError({'detail': 'Financial loan terms cannot be changed after the first repayment.'})
-            if not self.instance.interest_enabled and attrs.get('annual_interest_rate', self.instance.annual_interest_rate) != self.instance.annual_interest_rate:
+            if not self.instance.interest_enabled and any(field in attrs and attrs[field] != getattr(self.instance, field) for field in ('interest_method', 'annual_interest_rate', 'periodic_interest_rate', 'fixed_interest_amount', 'fixed_charge_behavior')):
                 raise serializers.ValidationError({'annual_interest_rate': 'Interest cannot be enabled retroactively for an existing loan.'})
+        method = attrs.get('interest_method', getattr(self.instance, 'interest_method', None))
+        annual = attrs.get('annual_interest_rate', getattr(self.instance, 'annual_interest_rate', Decimal('0')))
+        periodic = attrs.get('periodic_interest_rate', getattr(self.instance, 'periodic_interest_rate', None))
+        fixed = attrs.get('fixed_interest_amount', getattr(self.instance, 'fixed_interest_amount', None))
+        behavior = attrs.get('fixed_charge_behavior', getattr(self.instance, 'fixed_charge_behavior', 'full_until_settled'))
+        errors = {}
+        if method is None:
+            method = 'annual_percentage' if annual > 0 else 'none'
+        if method == 'none' and (annual > 0 or periodic not in (None, Decimal('0')) or fixed not in (None, Decimal('0'))): errors['interest_method'] = 'No-interest loans cannot include interest values.'
+        elif method == 'annual_percentage' and (annual <= 0 or periodic is not None or fixed is not None): errors['annual_interest_rate'] = 'Annual percentage requires only a positive annual interest rate.'
+        elif method in ('daily_percentage', 'weekly_percentage', 'monthly_percentage') and (periodic is None or periodic <= 0 or fixed is not None or annual > 0): errors['periodic_interest_rate'] = 'This method requires only a positive periodic interest rate.'
+        elif method in ('fixed_daily', 'fixed_weekly', 'fixed_monthly') and (fixed is None or fixed <= 0 or behavior not in ('full_until_settled', 'proportional_to_principal') or periodic is not None or annual > 0): errors['fixed_interest_amount'] = 'This method requires a positive fixed amount and valid charge behavior.'
+        elif method == 'fixed_total' and (fixed is None or fixed <= 0 or periodic is not None or annual > 0): errors['fixed_interest_amount'] = 'Fixed total requires one positive fixed interest amount.'
+        if errors: raise serializers.ValidationError(errors)
         return attrs
 
     def create(self, validated_data):
-        validated_data['interest_enabled'] = validated_data.get('annual_interest_rate', Decimal('0.0000')) > 0
+        method = validated_data.get('interest_method')
+        if not method:
+            method = 'annual_percentage' if validated_data.get('annual_interest_rate', Decimal('0')) > 0 else 'none'
+            validated_data['interest_method'] = method
+        validated_data['interest_enabled'] = method != 'none'
         return super().create(validated_data)
 
     def _snapshot(self, obj):

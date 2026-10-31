@@ -1,6 +1,7 @@
 """Deterministic simple-interest schedules for Budgetly loans."""
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from calendar import monthrange
 
 from django.utils import timezone
 
@@ -26,6 +27,8 @@ def _days_to_first_event(loan_date, event_date):
 
 def build_schedule(loan, repayments, as_of_date=None):
     """Return allocations and a snapshot; callers persist allocations atomically."""
+    if getattr(loan, 'interest_method', 'annual_percentage') not in ('none', 'annual_percentage'):
+        return _build_flexible_schedule(loan, repayments, as_of_date)
     as_of_date = as_of_date or timezone.localdate()
     ordered = sorted(repayments, key=lambda item: (item.repayment_date, item.created_at or timezone.now(), item.pk or 0))
     principal = Decimal(loan.original_amount)
@@ -61,6 +64,73 @@ def build_schedule(loan, repayments, as_of_date=None):
         'total_outstanding': post(principal + max(accrued, ZERO)),
         'interest_as_of_date': as_of_date,
     }
+
+
+def _add_months(value, count):
+    index = value.month - 1 + count
+    year, month = value.year + index // 12, index % 12 + 1
+    return date(year, month, min(value.day, monthrange(year, month)[1]))
+
+
+def _charge_dates(loan, end_date):
+    method = loan.interest_method
+    if method in ('none', 'fixed_total'):
+        return []
+    if method in ('daily_percentage', 'fixed_daily'):
+        current = loan.loan_date + timedelta(days=2)
+        step = lambda value: value + timedelta(days=1)
+    elif method in ('weekly_percentage', 'fixed_weekly'):
+        current = loan.loan_date + timedelta(days=8)
+        step = lambda value: value + timedelta(days=7)
+    else:
+        anniversaries = 1
+        current = _add_months(loan.loan_date, anniversaries) + timedelta(days=1)
+        def step(value):
+            nonlocal anniversaries
+            anniversaries += 1
+            return _add_months(loan.loan_date, anniversaries) + timedelta(days=1)
+    dates = []
+    while current <= end_date:
+        dates.append(current)
+        current = step(current)
+    return dates
+
+
+def _build_flexible_schedule(loan, repayments, as_of_date=None):
+    as_of_date = as_of_date or timezone.localdate()
+    ordered = sorted(repayments, key=lambda item: (item.repayment_date, item.created_at or timezone.now(), item.pk or 0))
+    if any(item.repayment_date < loan.loan_date for item in ordered):
+        raise ValueError('Repayment date cannot be before the loan date.')
+    end_date = max([as_of_date, *(item.repayment_date for item in ordered)])
+    events = [(value, 0, None) for value in _charge_dates(loan, end_date)]
+    events += [(item.repayment_date, 1, item) for item in ordered]
+    events.sort(key=lambda event: (event[0], event[1], event[2].created_at if event[2] else timezone.now(), event[2].pk if event[2] else 0))
+    principal, accrued, allocations = Decimal(loan.original_amount), ZERO, {}
+    if loan.interest_method == 'fixed_total':
+        accrued = Decimal(loan.fixed_interest_amount or ZERO)
+    for _, kind, repayment in events:
+        if kind == 0:
+            if principal <= ZERO:
+                continue
+            if loan.interest_method.endswith('percentage'):
+                accrued += principal * Decimal(loan.periodic_interest_rate) / Decimal('100')
+            else:
+                charge = Decimal(loan.fixed_interest_amount)
+                if loan.fixed_charge_behavior == 'proportional_to_principal':
+                    charge *= principal / Decimal(loan.original_amount)
+                accrued += charge
+            continue
+        due_interest = post(accrued)
+        if Decimal(repayment.amount) > principal + due_interest:
+            raise ValueError('Repayment cannot exceed the outstanding loan obligation.')
+        interest_amount = min(Decimal(repayment.amount), due_interest)
+        principal_amount = Decimal(repayment.amount) - interest_amount
+        principal -= principal_amount
+        accrued -= interest_amount
+        if principal == ZERO and post(accrued) == ZERO:
+            accrued = ZERO
+        allocations[repayment.pk] = {'principal_amount': post(principal_amount), 'interest_amount': post(interest_amount)}
+    return allocations, {'outstanding_principal': post(max(principal, ZERO)), 'accrued_interest': post(max(accrued, ZERO)), 'total_outstanding': post(max(principal, ZERO) + max(accrued, ZERO)), 'interest_as_of_date': as_of_date}
 
 
 def loan_snapshot(loan, as_of_date=None):
