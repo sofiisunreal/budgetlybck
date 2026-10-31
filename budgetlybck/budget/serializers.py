@@ -4,6 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from django.db.models import Sum
 from rest_framework import serializers
+from django.utils import timezone
 from exchange_rates.services import get_exchange_rate
 
 
@@ -286,8 +287,8 @@ class LoanRepaymentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = LoanRepayment
-        fields = ['id', 'loan', 'account', 'account_detail', 'amount', 'repayment_date', 'note', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        fields = ['id', 'loan', 'account', 'account_detail', 'amount', 'principal_amount', 'interest_amount', 'repayment_date', 'note', 'created_at']
+        read_only_fields = ['id', 'principal_amount', 'interest_amount', 'created_at']
 
     def validate(self, attrs):
         request = self.context['request']
@@ -302,9 +303,11 @@ class LoanRepaymentSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'account': 'Repayment account currency must match the loan currency.'
             })
-        repaid = loan.repayments.exclude(pk=getattr(self.instance, 'pk', None)).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-        if amount + repaid > loan.original_amount:
-            raise serializers.ValidationError({'amount': 'Repayment cannot exceed the remaining loan amount.'})
+        repayment_date = attrs.get('repayment_date', getattr(self.instance, 'repayment_date', None))
+        if repayment_date < loan.loan_date:
+            raise serializers.ValidationError({'repayment_date': 'Repayment date cannot be before the loan date.'})
+        if repayment_date > timezone.localdate():
+            raise serializers.ValidationError({'repayment_date': 'Repayment date cannot be in the future.'})
         return attrs
 
 
@@ -312,11 +315,15 @@ class LoanSerializer(serializers.ModelSerializer):
     account_detail = AccountRelatedSerializer(source='account', read_only=True)
     remaining_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     repayments = LoanRepaymentSerializer(many=True, read_only=True)
+    outstanding_principal = serializers.SerializerMethodField()
+    accrued_interest = serializers.SerializerMethodField()
+    total_outstanding = serializers.SerializerMethodField()
+    interest_as_of_date = serializers.SerializerMethodField()
 
     class Meta:
         model = Loan
-        fields = ['id', 'loan_type', 'person_name', 'original_amount', 'currency', 'account', 'account_detail', 'loan_date', 'due_date', 'description', 'status', 'remaining_amount', 'repayments', 'created_at']
-        read_only_fields = ['id', 'status', 'remaining_amount', 'repayments', 'created_at']
+        fields = ['id', 'loan_type', 'person_name', 'original_amount', 'annual_interest_rate', 'currency', 'account', 'account_detail', 'loan_date', 'due_date', 'description', 'status', 'remaining_amount', 'outstanding_principal', 'accrued_interest', 'total_outstanding', 'interest_as_of_date', 'repayments', 'created_at']
+        read_only_fields = ['id', 'status', 'remaining_amount', 'outstanding_principal', 'accrued_interest', 'total_outstanding', 'interest_as_of_date', 'repayments', 'created_at']
 
     def validate(self, attrs):
         request = self.context['request']
@@ -330,12 +337,30 @@ class LoanSerializer(serializers.ModelSerializer):
         if currency.upper() != account.currency:
             raise serializers.ValidationError({'currency': 'Loan currency must match the account currency.'})
         if self.instance:
-            repaid = self.instance.repayments.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+            repaid = self.instance.repayments.aggregate(total=Sum('principal_amount'))['total'] or Decimal('0.00')
             if original_amount < repaid:
                 raise serializers.ValidationError({
                     'original_amount': 'Original amount cannot be less than recorded repayments.'
                 })
+            financial_fields = ('annual_interest_rate', 'original_amount', 'loan_date', 'currency', 'loan_type')
+            if self.instance.repayments.exists() and any(field in attrs and attrs[field] != getattr(self.instance, field) for field in financial_fields):
+                raise serializers.ValidationError({'detail': 'Financial loan terms cannot be changed after the first repayment.'})
+            if not self.instance.interest_enabled and attrs.get('annual_interest_rate', self.instance.annual_interest_rate) != self.instance.annual_interest_rate:
+                raise serializers.ValidationError({'annual_interest_rate': 'Interest cannot be enabled retroactively for an existing loan.'})
         return attrs
+
+    def create(self, validated_data):
+        validated_data['interest_enabled'] = validated_data.get('annual_interest_rate', Decimal('0.0000')) > 0
+        return super().create(validated_data)
+
+    def _snapshot(self, obj):
+        from .services.loan_interest import loan_snapshot
+        return loan_snapshot(obj)
+
+    def get_outstanding_principal(self, obj): return self._snapshot(obj)['outstanding_principal']
+    def get_accrued_interest(self, obj): return self._snapshot(obj)['accrued_interest']
+    def get_total_outstanding(self, obj): return self._snapshot(obj)['total_outstanding']
+    def get_interest_as_of_date(self, obj): return self._snapshot(obj)['interest_as_of_date']
 
     def validate_currency(self, value):
         if len(value) != 3 or not value.isalpha():

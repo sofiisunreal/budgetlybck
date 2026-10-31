@@ -111,7 +111,8 @@ class DashboardSummaryView(APIView):
         loan_outstanding = defaultdict(lambda: Decimal("0.00"))
 
         for loan in active_loans:
-            loan_outstanding[loan.currency] += loan.remaining_amount
+            from budget.services.loan_interest import loan_snapshot
+            loan_outstanding[loan.currency] += loan_snapshot(loan)['total_outstanding']
 
         # -------------------------
         # Savings

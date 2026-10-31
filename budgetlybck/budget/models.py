@@ -182,6 +182,10 @@ class Loan(models.Model):
     loan_type = models.CharField(max_length=10, choices=LOAN_TYPES)
     person_name = models.CharField(max_length=150)
     original_amount = models.DecimalField(max_digits=14, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    annual_interest_rate = models.DecimalField(max_digits=7, decimal_places=4, default=Decimal('0.0000'), validators=[MinValueValidator(Decimal('0'))])
+    # Marks loans created with explicit v1 interest terms. Legacy loans stay
+    # interest-free and cannot be retroactively switched to interest-bearing.
+    interest_enabled = models.BooleanField(default=False)
     currency = models.CharField(max_length=3)
     account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name='loans')
     loan_date = models.DateField()
@@ -195,12 +199,14 @@ class Loan(models.Model):
 
     @property
     def remaining_amount(self):
-        repaid = self.repayments.aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        repaid = self.repayments.aggregate(total=Sum('principal_amount'))['total'] or Decimal('0.00')
         return self.original_amount - repaid
 
     def refresh_status(self):
-        remaining = self.remaining_amount
-        self.status = 'settled' if remaining == 0 else ('partially_paid' if remaining < self.original_amount else 'active')
+        from .services.loan_interest import loan_snapshot
+        snapshot = loan_snapshot(self)
+        remaining = snapshot['outstanding_principal']
+        self.status = 'settled' if snapshot['total_outstanding'] == 0 else ('partially_paid' if remaining < self.original_amount else 'active')
         self.save(update_fields=['status'])
 
 
@@ -208,6 +214,8 @@ class LoanRepayment(models.Model):
     loan = models.ForeignKey(Loan, on_delete=models.CASCADE, related_name='repayments')
     account = models.ForeignKey(Account, on_delete=models.PROTECT, related_name='loan_repayments')
     amount = models.DecimalField(max_digits=14, decimal_places=2, validators=[MinValueValidator(Decimal('0.01'))])
+    principal_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'), editable=False)
+    interest_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'), editable=False)
     repayment_date = models.DateField()
     note = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
