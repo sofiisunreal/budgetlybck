@@ -204,6 +204,7 @@ LEGAL_POLICY_VERSION = os.getenv('DJANGO_LEGAL_POLICY_VERSION', '1.0')
 FRONTEND_PASSWORD_RESET_URL = os.getenv(
     'DJANGO_FRONTEND_PASSWORD_RESET_URL', 'http://localhost:5173/reset-password'
 )
+FRONTEND_APP_URL = os.getenv('DJANGO_FRONTEND_APP_URL', 'http://localhost:5173')
 
 if not DEBUG:
     SECURE_SSL_REDIRECT = env_bool('DJANGO_SECURE_SSL_REDIRECT', True)

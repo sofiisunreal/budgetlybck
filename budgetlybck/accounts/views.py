@@ -10,18 +10,40 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
-from django.core.mail import send_mail
+from django.core.mail import EmailMultiAlternatives
+from django.template.loader import render_to_string
 from django.utils.http import urlsafe_base64_decode
 from django.conf import settings
+from django.db import transaction
 import logging
 
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
+
+def send_welcome_email(user):
+    """Best-effort post-commit email; registration must not depend on SMTP."""
+    try:
+        context = {'first_name': user.first_name or user.username, 'app_url': settings.FRONTEND_APP_URL.rstrip('/')}
+        message = EmailMultiAlternatives(
+            subject="Welcome to Budgetly. Let's make money simpler.",
+            body=render_to_string('accounts/emails/welcome.txt', context),
+            from_email=None,
+            to=[user.email],
+        )
+        message.attach_alternative(render_to_string('accounts/emails/welcome.html', context), 'text/html')
+        message.send(fail_silently=False)
+    except Exception:
+        logger.exception('Welcome email delivery failed')
+
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
+
+    def perform_create(self, serializer):
+        user = serializer.save()
+        transaction.on_commit(lambda: send_welcome_email(user))
 
 
 class ProfileView(generics.RetrieveUpdateAPIView):
@@ -111,18 +133,21 @@ class ForgotPasswordView(generics.GenericAPIView):
         )
 
         try:
-            send_mail(
+            context = {
+                'first_name': user.first_name or user.username,
+                'reset_link': reset_link,
+            }
+            message = EmailMultiAlternatives(
                 subject='Reset your Budgetly password',
-                message=(
-                    f'Hello {user.first_name or user.username},\n\n'
-                    f'Click the link below to reset your password:\n\n'
-                    f'{reset_link}\n\n'
-                    f'If you did not request this, you can ignore this email.'
-                ),
+                body=render_to_string('accounts/emails/password_reset.txt', context),
                 from_email=None,
-                recipient_list=[user.email],
-                fail_silently=False,
+                to=[user.email],
             )
+            message.attach_alternative(
+                render_to_string('accounts/emails/password_reset.html', context),
+                'text/html',
+            )
+            message.send(fail_silently=False)
 
         except Exception:
             logger.exception("Password reset email delivery failed")

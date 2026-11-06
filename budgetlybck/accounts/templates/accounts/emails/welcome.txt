@@ -1,0 +1,17 @@
+Budgetly
+
+Hey {{ first_name }},
+
+Money stuff, a little less complicated.
+
+Welcome to Budgetly. We're really glad you're here.
+
+Managing money can feel like a lot sometimes. Budgetly is here to help you see where things stand, make sense of your spending, and feel a little more in control.
+
+No pressure to figure everything out today. Start small, find your rhythm, and we'll be right here.
+
+Open Budgetly: {{ app_url }}
+
+Here's to making money feel a little easier.
+
+Budgetly · A clearer way to manage money.
