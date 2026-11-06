@@ -13,6 +13,9 @@ from django.utils.http import urlsafe_base64_encode
 from django.core.mail import send_mail
 from django.utils.http import urlsafe_base64_decode
 from django.conf import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -80,6 +83,7 @@ class ChangePasswordView(generics.GenericAPIView):
             status=200
         )
 
+
 class ForgotPasswordView(generics.GenericAPIView):
     serializer_class = ForgotPasswordSerializer
     permission_classes = [AllowAny]
@@ -95,26 +99,43 @@ class ForgotPasswordView(generics.GenericAPIView):
 
         try:
             user = User.objects.get(email=email)
-
         except User.DoesNotExist:
             return Response(generic_response, status=200)
 
         uid = urlsafe_base64_encode(force_bytes(user.pk))
         token = default_token_generator.make_token(user)
-        reset_link = f'{settings.FRONTEND_PASSWORD_RESET_URL.rstrip("/")}/{uid}/{token}/'
-        send_mail(
-            subject='Reset your Budgetly password',
-            message=(
-                f'Hello {user.first_name or user.username},\n\n'
-                f'Click the link below to reset your password:\n\n'
-                f'{reset_link}\n\n'
-                f'If you did not request this, you can ignore this email.'
-            ),
-            from_email=None,
-            recipient_list=[user.email],
+
+        reset_link = (
+            f'{settings.FRONTEND_PASSWORD_RESET_URL.rstrip("/")}/'
+            f'{uid}/{token}/'
         )
 
+        try:
+            send_mail(
+                subject='Reset your Budgetly password',
+                message=(
+                    f'Hello {user.first_name or user.username},\n\n'
+                    f'Click the link below to reset your password:\n\n'
+                    f'{reset_link}\n\n'
+                    f'If you did not request this, you can ignore this email.'
+                ),
+                from_email=None,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+
+        except Exception:
+            logger.exception("Password reset email delivery failed")
+            return Response(
+                {
+                    'message': 'Unable to process the password reset request right now.'
+                },
+                status=503,
+            )
+
         return Response(generic_response, status=200)
+
+
 
 class ResetPasswordView(generics.GenericAPIView):
     serializer_class = ResetPasswordSerializer
