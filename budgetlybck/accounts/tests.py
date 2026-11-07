@@ -6,8 +6,11 @@ from django.test import TransactionTestCase
 from django.db import transaction
 from unittest.mock import patch
 from rest_framework import status
-from rest_framework.test import APITestCase, APIRequestFactory
-from .views import ForgotPasswordView, RegisterView, send_welcome_email
+from rest_framework.test import APITestCase, APIRequestFactory, force_authenticate
+from .views import DeleteAccountView, ForgotPasswordView, RegisterView, send_welcome_email
+from budget.models import Account, Budget, Category, Loan, LoanRepayment, Transaction, Transfer
+from feedback.models import Feedback
+from savings.models import SavingsContribution, SavingsGoal, SavingsPlan, SavingsWithdrawal
 
 
 User = get_user_model()
@@ -135,3 +138,116 @@ class WelcomeEmailTests(TransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertTrue(User.objects.filter(email="welcome@example.com").exists())
         self.assertIn("Welcome email delivery failed", "\n".join(logs.output))
+
+
+class AccountDeletionTests(APITestCase):
+    """Exercise the explicit, FK-safe self-service deletion workflow."""
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.user = User.objects.create_user("delete-user", "delete@example.com", "SafePassword123!")
+        self.account = Account.objects.create(user=self.user, name="Cash", account_type="cash", currency="KES")
+        self.second_account = Account.objects.create(user=self.user, name="Bank", account_type="bank", currency="KES")
+        self.category = Category.objects.create(user=self.user, name="Food", category_type="expense")
+        self.global_category = Category.objects.create(name="Global income", category_type="income")
+        self.transaction = Transaction.objects.create(user=self.user, account=self.account, category=self.category, transaction_type="expense", description="Lunch", amount="10.00", transaction_date="2026-01-01")
+        self.budget = Budget.objects.create(user=self.user, category=self.category, amount="100.00", period_type="monthly", start_date="2026-01-01", end_date="2026-01-31")
+        self.transfer = Transfer.objects.create(user=self.user, from_account=self.account, to_account=self.second_account, from_amount="10.00", to_amount="10.00", exchange_rate="1.00000000", transaction_date="2026-01-01")
+        self.loan = Loan.objects.create(user=self.user, loan_type="borrowed", person_name="Amina", original_amount="100.00", currency="KES", account=self.account, loan_date="2026-01-01")
+        self.repayment = LoanRepayment.objects.create(loan=self.loan, account=self.account, amount="10.00", principal_amount="10.00", repayment_date="2026-01-02")
+        self.goal = SavingsGoal.objects.create(user=self.user, name="Emergency", target_amount="100.00", currency="KES", account=self.account)
+        self.contribution = SavingsContribution.objects.create(goal=self.goal, amount="10.00", contribution_date="2026-01-02")
+        self.withdrawal = SavingsWithdrawal.objects.create(goal=self.goal, amount="1.00", withdrawal_date="2026-01-03")
+        self.plan = SavingsPlan.objects.create(goal=self.goal, amount="10.00", frequency="monthly", start_date="2026-01-01")
+        self.feedback = Feedback.objects.create(user=self.user, category="general", title="Idea", description="Test feedback")
+
+        self.other_user = User.objects.create_user("other-user", "other@example.com", "SafePassword123!")
+        self.other_account = Account.objects.create(user=self.other_user, name="Other cash", account_type="cash", currency="KES")
+        self.other_category = Category.objects.create(user=self.other_user, name="Other food", category_type="expense")
+        self.other_transaction = Transaction.objects.create(user=self.other_user, account=self.other_account, category=self.other_category, transaction_type="expense", description="Other lunch", amount="10.00", transaction_date="2026-01-01")
+        self.other_feedback = Feedback.objects.create(user=self.other_user, category="general", title="Other idea", description="Other feedback")
+
+    def delete_request(self, password="SafePassword123!"):
+        request = self.factory.delete("/api/auth/delete-account/", {"password": password}, format="json")
+        force_authenticate(request, user=self.user)
+        return DeleteAccountView.as_view()(request)
+
+    def test_empty_account_deletion_succeeds(self):
+        empty_user = User.objects.create_user("empty-user", "empty@example.com", "SafePassword123!")
+        request = self.factory.delete("/api/auth/delete-account/", {"password": "SafePassword123!"}, format="json")
+        force_authenticate(request, user=empty_user)
+
+        response = DeleteAccountView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(User.objects.filter(pk=empty_user.pk).exists())
+
+    def test_populated_account_deletion_removes_only_owned_records(self):
+        response = self.delete_request()
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(User.objects.filter(pk=self.user.pk).exists())
+        self.assertFalse(Account.objects.filter(pk__in=[self.account.pk, self.second_account.pk]).exists())
+        self.assertFalse(Transaction.objects.filter(pk=self.transaction.pk).exists())
+        self.assertFalse(Budget.objects.filter(pk=self.budget.pk).exists())
+        self.assertFalse(Transfer.objects.filter(pk=self.transfer.pk).exists())
+        self.assertFalse(Loan.objects.filter(pk=self.loan.pk).exists())
+        self.assertFalse(LoanRepayment.objects.filter(pk=self.repayment.pk).exists())
+        self.assertFalse(SavingsGoal.objects.filter(pk=self.goal.pk).exists())
+        self.assertFalse(SavingsContribution.objects.filter(pk=self.contribution.pk).exists())
+        self.assertFalse(SavingsWithdrawal.objects.filter(pk=self.withdrawal.pk).exists())
+        self.assertFalse(SavingsPlan.objects.filter(pk=self.plan.pk).exists())
+        self.assertFalse(Feedback.objects.filter(pk=self.feedback.pk).exists())
+        self.assertFalse(Category.objects.filter(pk=self.category.pk).exists())
+        self.assertTrue(Category.objects.filter(pk=self.global_category.pk).exists())
+        self.assertTrue(User.objects.filter(pk=self.other_user.pk).exists())
+        self.assertTrue(Account.objects.filter(pk=self.other_account.pk).exists())
+        self.assertTrue(Transaction.objects.filter(pk=self.other_transaction.pk).exists())
+        self.assertTrue(Feedback.objects.filter(pk=self.other_feedback.pk).exists())
+        self.assertTrue(Category.objects.filter(pk=self.other_category.pk).exists())
+
+    def test_incorrect_password_keeps_records_and_returns_bad_request(self):
+        response = self.delete_request("wrong-password")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("password", response.data)
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+        self.assertTrue(Transaction.objects.filter(pk=self.transaction.pk).exists())
+        self.assertTrue(LoanRepayment.objects.filter(pk=self.repayment.pk).exists())
+        self.assertTrue(SavingsGoal.objects.filter(pk=self.goal.pk).exists())
+
+    def test_failure_rolls_back_all_deletions(self):
+        with patch("feedback.models.Feedback.objects.filter", side_effect=RuntimeError("forced failure")):
+            with self.assertLogs("accounts.views", level="ERROR"):
+                response = self.delete_request()
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(response.data["detail"], "Account deletion could not be completed. No records were deleted.")
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+        self.assertTrue(Account.objects.filter(pk=self.account.pk).exists())
+        self.assertTrue(Transaction.objects.filter(pk=self.transaction.pk).exists())
+        self.assertTrue(Budget.objects.filter(pk=self.budget.pk).exists())
+        self.assertTrue(Transfer.objects.filter(pk=self.transfer.pk).exists())
+        self.assertTrue(Loan.objects.filter(pk=self.loan.pk).exists())
+        self.assertTrue(LoanRepayment.objects.filter(pk=self.repayment.pk).exists())
+        self.assertTrue(SavingsGoal.objects.filter(pk=self.goal.pk).exists())
+        self.assertTrue(SavingsContribution.objects.filter(pk=self.contribution.pk).exists())
+        self.assertTrue(SavingsWithdrawal.objects.filter(pk=self.withdrawal.pk).exists())
+        self.assertTrue(SavingsPlan.objects.filter(pk=self.plan.pk).exists())
+
+    def test_cross_user_savings_link_returns_conflict_without_changes(self):
+        foreign_goal = SavingsGoal.objects.create(
+            user=self.other_user,
+            name="Foreign goal",
+            target_amount="50.00",
+            currency="KES",
+            account=self.account,
+        )
+
+        response = self.delete_request()
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+        self.assertTrue(Account.objects.filter(pk=self.account.pk).exists())
+        foreign_goal.refresh_from_db()
+        self.assertEqual(foreign_goal.account_id, self.account.pk)
