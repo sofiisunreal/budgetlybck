@@ -1,7 +1,11 @@
 from django.contrib.auth import get_user_model
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
+
+from .models import PolicyAcceptance, PolicyDocument
 
 
 User = get_user_model()
@@ -52,6 +56,14 @@ class RegisterSerializer(serializers.ModelSerializer):
         if errors:
             raise serializers.ValidationError(errors)
 
+        # The document registry is opt-in during rollout: existing
+        # registration remains compatible until an operator stores and
+        # activates both actual documents. A partial activation is rejected.
+        try:
+            self.active_policy_documents = PolicyDocument.active_documents()
+        except ValidationError as error:
+            raise serializers.ValidationError({'non_field_errors': error.messages})
+
         return data
 
     def create(self, validated_data):
@@ -61,17 +73,20 @@ class RegisterSerializer(serializers.ModelSerializer):
         validated_data.pop('accept_privacy_policy')
         accepted_at = timezone.now()
 
-        user = User.objects.create_user(
-            username=validated_data['username'],
-            email=validated_data['email'],
-            password=validated_data['password'],
-            first_name=validated_data.get('first_name', ''),
-            last_name=validated_data.get('last_name', ''),
-            age_eligibility_confirmed=True,
-            terms_accepted_at=accepted_at,
-            privacy_policy_accepted_at=accepted_at,
-            accepted_policy_version=settings.LEGAL_POLICY_VERSION,
-        )
+        with transaction.atomic():
+            user = User.objects.create_user(
+                username=validated_data['username'],
+                email=validated_data['email'],
+                password=validated_data['password'],
+                first_name=validated_data.get('first_name', ''),
+                last_name=validated_data.get('last_name', ''),
+                age_eligibility_confirmed=True,
+                terms_accepted_at=accepted_at,
+                privacy_policy_accepted_at=accepted_at,
+                accepted_policy_version=settings.LEGAL_POLICY_VERSION,
+            )
+            for document in (getattr(self, 'active_policy_documents', None) or {}).values():
+                PolicyAcceptance.objects.create(user=user, document=document)
 
         return user
 

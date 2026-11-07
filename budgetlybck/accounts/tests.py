@@ -1,13 +1,16 @@
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.core import mail
 from django.test import override_settings
 from django.test import TransactionTestCase
 from django.db import transaction
 from unittest.mock import patch
+import hashlib
 from rest_framework import status
 from rest_framework.test import APITestCase, APIRequestFactory, force_authenticate
 from .views import DeleteAccountView, ForgotPasswordView, RegisterView, send_welcome_email
+from .models import PolicyAcceptance, PolicyDocument
 from budget.models import Account, Budget, Category, Loan, LoanRepayment, Transaction, Transfer
 from feedback.models import Feedback
 from savings.models import SavingsContribution, SavingsGoal, SavingsPlan, SavingsWithdrawal
@@ -44,6 +47,81 @@ class RegistrationLegalAcceptanceTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("accept_terms", response.data)
         self.assertFalse(User.objects.filter(email="new-user@example.com").exists())
+
+    def test_active_documents_create_acceptances_for_the_exact_documents(self):
+        terms = PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS,
+            version="1.0",
+            content="Terms of Service v1.0",
+            is_active=True,
+        )
+        privacy = PolicyDocument.objects.create(
+            document_type=PolicyDocument.PRIVACY,
+            version="1.0",
+            content="Privacy Policy v1.0",
+            is_active=True,
+        )
+
+        response = self.client.post(self.url, self.payload(), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        user = User.objects.get(email="new-user@example.com")
+        acceptances = PolicyAcceptance.objects.filter(user=user).select_related("document")
+        self.assertEqual(set(acceptance.document_id for acceptance in acceptances), {terms.id, privacy.id})
+        self.assertTrue(all(acceptance.accepted_at for acceptance in acceptances))
+        self.assertEqual(terms.content_sha256, hashlib.sha256(terms.content.encode("utf-8")).hexdigest())
+
+    def test_legacy_acceptance_data_is_not_rewritten_for_existing_users(self):
+        user = User.objects.create_user(
+            username="legacy-user",
+            email="legacy@example.com",
+            password="SafePassword123!",
+            accepted_policy_version="1.0",
+        )
+        original_version = user.accepted_policy_version
+        PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS,
+            version="1.0",
+            content="Terms of Service v1.0",
+            is_active=True,
+        )
+        PolicyDocument.objects.create(
+            document_type=PolicyDocument.PRIVACY,
+            version="1.0",
+            content="Privacy Policy v1.0",
+            is_active=True,
+        )
+
+        user.refresh_from_db()
+
+        self.assertEqual(user.accepted_policy_version, original_version)
+        self.assertFalse(PolicyAcceptance.objects.filter(user=user).exists())
+
+    def test_partial_document_activation_blocks_registration(self):
+        PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS,
+            version="1.0",
+            content="Terms of Service v1.0",
+            is_active=True,
+        )
+
+        response = self.client.post(self.url, self.payload(), format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(User.objects.filter(email="new-user@example.com").exists())
+
+    def test_accepted_document_content_cannot_be_changed(self):
+        document = PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS,
+            version="1.0",
+            content="Terms of Service v1.0",
+        )
+        user = User.objects.create_user("accepted-user", "accepted@example.com", "SafePassword123!")
+        PolicyAcceptance.objects.create(user=user, document=document)
+        document.content = "Changed text"
+
+        with self.assertRaises(ValidationError):
+            document.save()
 
 
 @override_settings(
@@ -160,6 +238,14 @@ class AccountDeletionTests(APITestCase):
         self.withdrawal = SavingsWithdrawal.objects.create(goal=self.goal, amount="1.00", withdrawal_date="2026-01-03")
         self.plan = SavingsPlan.objects.create(goal=self.goal, amount="10.00", frequency="monthly", start_date="2026-01-01")
         self.feedback = Feedback.objects.create(user=self.user, category="general", title="Idea", description="Test feedback")
+        self.terms_document = PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS, version="test-1.0", content="Test terms"
+        )
+        self.privacy_document = PolicyDocument.objects.create(
+            document_type=PolicyDocument.PRIVACY, version="test-1.0", content="Test privacy"
+        )
+        PolicyAcceptance.objects.create(user=self.user, document=self.terms_document)
+        PolicyAcceptance.objects.create(user=self.user, document=self.privacy_document)
 
         self.other_user = User.objects.create_user("other-user", "other@example.com", "SafePassword123!")
         self.other_account = Account.objects.create(user=self.other_user, name="Other cash", account_type="cash", currency="KES")
@@ -198,6 +284,9 @@ class AccountDeletionTests(APITestCase):
         self.assertFalse(SavingsWithdrawal.objects.filter(pk=self.withdrawal.pk).exists())
         self.assertFalse(SavingsPlan.objects.filter(pk=self.plan.pk).exists())
         self.assertFalse(Feedback.objects.filter(pk=self.feedback.pk).exists())
+        self.assertFalse(PolicyAcceptance.objects.filter(user_id=self.user.pk).exists())
+        self.assertTrue(PolicyDocument.objects.filter(pk=self.terms_document.pk).exists())
+        self.assertTrue(PolicyDocument.objects.filter(pk=self.privacy_document.pk).exists())
         self.assertFalse(Category.objects.filter(pk=self.category.pk).exists())
         self.assertTrue(Category.objects.filter(pk=self.global_category.pk).exists())
         self.assertTrue(User.objects.filter(pk=self.other_user.pk).exists())
@@ -234,6 +323,7 @@ class AccountDeletionTests(APITestCase):
         self.assertTrue(SavingsContribution.objects.filter(pk=self.contribution.pk).exists())
         self.assertTrue(SavingsWithdrawal.objects.filter(pk=self.withdrawal.pk).exists())
         self.assertTrue(SavingsPlan.objects.filter(pk=self.plan.pk).exists())
+        self.assertEqual(PolicyAcceptance.objects.filter(user=self.user).count(), 2)
 
     def test_cross_user_savings_link_returns_conflict_without_changes(self):
         foreign_goal = SavingsGoal.objects.create(
