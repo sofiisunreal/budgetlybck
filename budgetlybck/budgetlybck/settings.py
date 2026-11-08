@@ -212,6 +212,9 @@ FRONTEND_APP_URL = os.getenv('DJANGO_FRONTEND_APP_URL', 'http://localhost:5173')
 BILLING_LIFETIME_PRICE_MINOR = int(os.getenv('BILLING_LIFETIME_PRICE_MINOR', '105000'))
 BILLING_LIFETIME_CURRENCY = os.getenv('BILLING_LIFETIME_CURRENCY', 'KES')
 BILLING_LIFETIME_OFFER_NAME = os.getenv('BILLING_LIFETIME_OFFER_NAME', 'Budgetly Lifetime Access')
+# Phase 4 is deliberately deployable without changing present access. Set to
+# true only after founding-user grants and end-to-end payment testing finish.
+BILLING_ENFORCE_LIFETIME_ACCESS = env_bool('BILLING_ENFORCE_LIFETIME_ACCESS', False)
 
 # Paystack remains test-only until a separately approved production rollout.
 PAYSTACK_MODE = os.getenv('PAYSTACK_MODE', 'test')

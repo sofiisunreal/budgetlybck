@@ -14,11 +14,12 @@ from rest_framework.response import Response
 
 from .models import Account, Budget, Category, Loan, LoanRepayment, Transaction, Transfer
 from .serializers import AccountSerializer, BudgetSerializer, CategorySerializer, LoanRepaymentSerializer, LoanSerializer, TransactionSerializer, TransferSerializer
+from billing.permissions import HasLifetimeAccess
 
 
 class CategoryViewSet(viewsets.ModelViewSet):
     serializer_class = CategorySerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
     def get_queryset(self):
         return Category.objects.filter(models.Q(user__isnull=True) | models.Q(user=self.request.user))
@@ -38,7 +39,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
 
 class UserOwnedModelViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
     def get_queryset(self):
         return self.queryset.filter(user=self.request.user)
@@ -119,7 +120,7 @@ class LoanViewSet(UserOwnedModelViewSet):
 
 class LoanRepaymentViewSet(viewsets.ModelViewSet):
     serializer_class = LoanRepaymentSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
     queryset = LoanRepayment.objects.select_related('loan', 'account')
 
     def get_queryset(self):

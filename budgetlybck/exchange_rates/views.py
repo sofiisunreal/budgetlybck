@@ -4,10 +4,11 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import ValidationError
 
 from .services import get_exchange_rate
+from billing.permissions import HasLifetimeAccess
 
 
 class ExchangeRateView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
     def get(self, request):
         from_currency = request.query_params.get("from")

@@ -12,9 +12,10 @@ from rest_framework.exceptions import ValidationError
 from budget.models import (Account,Transaction,Budget,Loan,)
 
 from savings.models import SavingsGoal
+from billing.permissions import HasLifetimeAccess
 
 class DashboardSummaryView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
     def get(self, request):
         month_value = request.query_params.get("month")

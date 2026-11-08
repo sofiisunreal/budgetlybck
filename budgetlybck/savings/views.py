@@ -4,11 +4,12 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import SavingsGoal, SavingsContribution, SavingsWithdrawal,SavingsPlan
 from .serializers import SavingsGoalSerializer, SavingsContributionSerializer, SavingsPlanSerializer,  SavingsWithdrawalSerializer
+from billing.permissions import HasLifetimeAccess
 
 
 class SavingsGoalViewSet(ModelViewSet):
     serializer_class = SavingsGoalSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
     def get_queryset(self):
         return SavingsGoal.objects.filter(user=self.request.user)
@@ -20,7 +21,7 @@ class SavingsGoalViewSet(ModelViewSet):
 
 class SavingsGoalViewSet(ModelViewSet):
     serializer_class = SavingsGoalSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
     def get_queryset(self):
         return SavingsGoal.objects.filter(user=self.request.user)
@@ -110,7 +111,7 @@ class SavingsGoalViewSet(ModelViewSet):
 
 class SavingsContributionViewSet(ModelViewSet):
     serializer_class = SavingsContributionSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
 
     def get_queryset(self):
@@ -125,7 +126,7 @@ class SavingsContributionViewSet(ModelViewSet):
 
 class SavingsWithdrawalViewSet(ModelViewSet):
     serializer_class = SavingsWithdrawalSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
     def get_queryset(self):
         return SavingsWithdrawal.objects.filter(
@@ -134,7 +135,7 @@ class SavingsWithdrawalViewSet(ModelViewSet):
 
 class SavingsPlanViewSet(ModelViewSet):
     serializer_class = SavingsPlanSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasLifetimeAccess]
 
     def get_queryset(self):
         return SavingsPlan.objects.filter(

@@ -111,6 +111,107 @@ class BillingModelTests(TestCase):
         self.assertEqual(str(account.current_balance), '-10.00')
 
 
+@override_settings(BILLING_ENFORCE_LIFETIME_ACCESS=True)
+class LifetimeAccessEnforcementTests(APITestCase):
+    """Server-side access gating for every financial API family."""
+
+    def setUp(self):
+        self.user = User.objects.create_user('unpaid', 'unpaid@example.com', 'SafePassword123!')
+        self.other_user = User.objects.create_user('paid-other', 'other@example.com', 'SafePassword123!')
+        self.account = Account.objects.create(user=self.user, name='Cash', account_type='cash', currency='KES')
+        self.other_account = Account.objects.create(user=self.other_user, name='Other cash', account_type='cash', currency='KES')
+        self.category = Category.objects.create(name='Food', category_type='expense')
+        self.client.force_authenticate(self.user)
+
+    def assert_payment_required(self, response):
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data, {
+            'detail': 'Lifetime access is required for financial features.',
+            'code': 'payment_required',
+        })
+
+    def grant_access(self, user=None):
+        return LifetimeAccessEntitlement.grant_legacy_access(user or self.user)[0]
+
+    def test_disabled_by_default_preserves_financial_access(self):
+        with self.settings(BILLING_ENFORCE_LIFETIME_ACCESS=False):
+            response = self.client.get('/api/accounts/')
+        self.assertEqual(response.status_code, 200)
+
+    def test_unpaid_user_is_denied_financial_reads_and_writes(self):
+        for response in (
+            self.client.get('/api/categories/'),
+            self.client.get('/api/accounts/'),
+            self.client.get('/api/transactions/'),
+            self.client.get('/api/transactions/summary/'),
+            self.client.get('/api/transfers/'),
+            self.client.get('/api/loans/'),
+            self.client.get('/api/loan-repayments/'),
+            self.client.get('/api/budgets/'),
+            self.client.get('/api/savings/goals/'),
+            self.client.get('/api/savings/contributions/'),
+            self.client.get('/api/savings/withdrawals/'),
+            self.client.get('/api/savings/plans/'),
+            self.client.get('/api/dashboard/summary/'),
+            self.client.get('/api/exchange-rates/?from=KES&to=USD'),
+            self.client.post('/api/accounts/', {'name': 'Blocked', 'account_type': 'cash', 'currency': 'KES'}, format='json'),
+            self.client.patch(f'/api/accounts/{self.account.pk}/', {'name': 'Blocked'}, format='json'),
+            self.client.delete(f'/api/accounts/{self.account.pk}/'),
+        ):
+            self.assert_payment_required(response)
+
+    def test_active_entitlement_allows_financial_access_but_ownership_still_applies(self):
+        self.grant_access()
+
+        self.assertEqual(self.client.get('/api/accounts/').status_code, 200)
+        self.assertEqual(self.client.get('/api/dashboard/summary/').status_code, 200)
+        self.assertEqual(self.client.get('/api/savings/goals/').status_code, 200)
+        self.assertEqual(self.client.post('/api/accounts/', {
+            'name': 'Wallet', 'account_type': 'cash', 'currency': 'KES',
+        }, format='json').status_code, 201)
+        self.assertEqual(self.client.get(f'/api/accounts/{self.other_account.pk}/').status_code, 404)
+
+    def test_non_active_entitlement_statuses_are_denied(self):
+        entitlement = self.grant_access()
+        for status_value in (
+            LifetimeAccessEntitlement.REVOKED,
+            LifetimeAccessEntitlement.REFUNDED,
+            LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED,
+        ):
+            entitlement.status = status_value
+            entitlement.save(update_fields=['status'])
+            self.assert_payment_required(self.client.get('/api/accounts/'))
+
+    def test_staff_is_not_exempt_from_financial_payment_requirement(self):
+        self.user.is_staff = True
+        self.user.save(update_fields=['is_staff'])
+
+        self.assert_payment_required(self.client.get('/api/accounts/'))
+
+    def test_billing_and_account_management_remain_payment_exempt(self):
+        offer = LifetimeAccessOffer.objects.create(
+            name='Lifetime offer', price_minor=105000, currency='KES', is_active=True,
+        )
+        attempt = PaystackPurchaseAttempt.objects.create(
+            user=self.user, offer=offer, expected_amount_minor=105000,
+            expected_currency='KES', status=PaystackPurchaseAttempt.PENDING,
+        )
+
+        self.assertEqual(self.client.get('/api/billing/access/').status_code, 200)
+        self.assertEqual(self.client.get(f'/api/billing/purchases/{attempt.reference}/').status_code, 200)
+        self.assertEqual(self.client.get('/api/auth/profile/').status_code, 200)
+        self.assertEqual(self.client.get('/api/auth/legal-status/').status_code, 200)
+        self.assertEqual(
+            self.client.delete('/api/auth/delete-account/', {'password': 'wrong-password'}, format='json').status_code,
+            400,
+        )
+
+    def test_unauthenticated_financial_request_is_401_not_payment_required(self):
+        self.client.force_authenticate(user=None)
+        response = self.client.get('/api/accounts/')
+        self.assertEqual(response.status_code, 401)
+
+
 class BillingManagementCommandTests(TestCase):
     cutoff = '2026-01-01T00:00:00+00:00'
 
