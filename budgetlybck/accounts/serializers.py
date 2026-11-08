@@ -11,6 +11,49 @@ from .models import PolicyAcceptance, PolicyDocument
 User = get_user_model()
 
 
+class PolicyDocumentSerializer(serializers.ModelSerializer):
+    effective_at = serializers.DateTimeField(source='published_at', read_only=True)
+
+    class Meta:
+        model = PolicyDocument
+        fields = ['id', 'document_type', 'version', 'content', 'content_sha256', 'published_at', 'effective_at']
+        read_only_fields = fields
+
+
+class PolicyDocumentIdentitySerializer(serializers.Serializer):
+    id = serializers.IntegerField(min_value=1)
+    version = serializers.CharField(max_length=50)
+    content_sha256 = serializers.RegexField(regex=r'^[0-9a-f]{64}$')
+
+
+def validate_active_document_identities(terms_identity, privacy_identity):
+    """Return the active exact documents, rejecting stale client identities."""
+    try:
+        documents = PolicyDocument.active_documents()
+    except ValidationError as error:
+        raise serializers.ValidationError({'legal_documents': error.messages})
+
+    if documents is None:
+        raise serializers.ValidationError({
+            'legal_documents': 'Legal documents are not currently available for acceptance.'
+        })
+
+    submitted = {
+        PolicyDocument.TERMS: terms_identity,
+        PolicyDocument.PRIVACY: privacy_identity,
+    }
+    errors = {}
+    for document_type, document in documents.items():
+        identity = submitted[document_type]
+        if any(identity[key] != getattr(document, key) for key in ('id', 'version', 'content_sha256')):
+            errors[f'{document_type}_document'] = (
+                'Document identity must match the currently active document.'
+            )
+    if errors:
+        raise serializers.ValidationError(errors)
+    return documents
+
+
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(
         write_only=True,
@@ -23,6 +66,8 @@ class RegisterSerializer(serializers.ModelSerializer):
     age_eligibility = serializers.BooleanField(write_only=True, required=True)
     accept_terms = serializers.BooleanField(write_only=True, required=True)
     accept_privacy_policy = serializers.BooleanField(write_only=True, required=True)
+    terms_document = PolicyDocumentIdentitySerializer(write_only=True, required=False)
+    privacy_document = PolicyDocumentIdentitySerializer(write_only=True, required=False)
 
     class Meta:
         model = User
@@ -34,6 +79,8 @@ class RegisterSerializer(serializers.ModelSerializer):
             'age_eligibility',
             'accept_terms',
             'accept_privacy_policy',
+            'terms_document',
+            'privacy_document',
             'first_name',
             'last_name',
         ]
@@ -56,13 +103,19 @@ class RegisterSerializer(serializers.ModelSerializer):
         if errors:
             raise serializers.ValidationError(errors)
 
-        # The document registry is opt-in during rollout: existing
-        # registration remains compatible until an operator stores and
-        # activates both actual documents. A partial activation is rejected.
-        try:
-            self.active_policy_documents = PolicyDocument.active_documents()
-        except ValidationError as error:
-            raise serializers.ValidationError({'non_field_errors': error.messages})
+        required_documents = {
+            'terms_document': data.get('terms_document'),
+            'privacy_document': data.get('privacy_document'),
+        }
+        missing = {
+            field: 'This field is required.' for field, identity in required_documents.items() if identity is None
+        }
+        if missing:
+            raise serializers.ValidationError(missing)
+
+        self.active_policy_documents = validate_active_document_identities(
+            required_documents['terms_document'], required_documents['privacy_document']
+        )
 
         return data
 
@@ -71,6 +124,8 @@ class RegisterSerializer(serializers.ModelSerializer):
         validated_data.pop('age_eligibility')
         validated_data.pop('accept_terms')
         validated_data.pop('accept_privacy_policy')
+        validated_data.pop('terms_document')
+        validated_data.pop('privacy_document')
         accepted_at = timezone.now()
 
         with transaction.atomic():
@@ -85,10 +140,21 @@ class RegisterSerializer(serializers.ModelSerializer):
                 privacy_policy_accepted_at=accepted_at,
                 accepted_policy_version=settings.LEGAL_POLICY_VERSION,
             )
-            for document in (getattr(self, 'active_policy_documents', None) or {}).values():
+            for document in self.active_policy_documents.values():
                 PolicyAcceptance.objects.create(user=user, document=document)
 
         return user
+
+
+class PolicyAcceptanceSerializer(serializers.Serializer):
+    terms_document = PolicyDocumentIdentitySerializer(write_only=True)
+    privacy_document = PolicyDocumentIdentitySerializer(write_only=True)
+
+    def validate(self, attrs):
+        self.documents = validate_active_document_identities(
+            attrs['terms_document'], attrs['privacy_document']
+        )
+        return attrs
 
 
 class UserSerializer(serializers.ModelSerializer):

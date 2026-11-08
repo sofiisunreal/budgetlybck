@@ -73,6 +73,7 @@ INSTALLED_APPS = [
     'dashboard',
     'exchange_rates',
     'feedback',
+    'billing',
 ]
 
 AUTH_USER_MODEL = 'accounts.User'
@@ -205,6 +206,25 @@ FRONTEND_PASSWORD_RESET_URL = os.getenv(
     'DJANGO_FRONTEND_PASSWORD_RESET_URL', 'http://localhost:5173/reset-password'
 )
 FRONTEND_APP_URL = os.getenv('DJANGO_FRONTEND_APP_URL', 'http://localhost:5173')
+
+# Billing foundation. Checkout and webhook code are intentionally not enabled
+# in this phase; these values seed and validate the server-owned offer only.
+BILLING_LIFETIME_PRICE_MINOR = int(os.getenv('BILLING_LIFETIME_PRICE_MINOR', '105000'))
+BILLING_LIFETIME_CURRENCY = os.getenv('BILLING_LIFETIME_CURRENCY', 'KES')
+BILLING_LIFETIME_OFFER_NAME = os.getenv('BILLING_LIFETIME_OFFER_NAME', 'Budgetly Lifetime Access')
+
+# Paystack remains test-only until a separately approved production rollout.
+PAYSTACK_MODE = os.getenv('PAYSTACK_MODE', 'test')
+PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
+PAYSTACK_WEBHOOK_SIGNING_SECRET = os.getenv('PAYSTACK_WEBHOOK_SIGNING_SECRET', '')
+PAYSTACK_WEBHOOK_PREVIOUS_SIGNING_SECRET = os.getenv('PAYSTACK_WEBHOOK_PREVIOUS_SIGNING_SECRET', '')
+PAYSTACK_ALLOW_LEGACY_WEBHOOK_SIGNATURE = env_bool('PAYSTACK_ALLOW_LEGACY_WEBHOOK_SIGNATURE', False)
+PAYSTACK_CALLBACK_URL = os.getenv('PAYSTACK_CALLBACK_URL', 'http://localhost:8000/api/billing/paystack/callback/')
+FRONTEND_PAYMENT_RETURN_URL = os.getenv('FRONTEND_PAYMENT_RETURN_URL', 'http://localhost:5173/payment/complete')
+PAYSTACK_CONNECT_TIMEOUT_SECONDS = float(os.getenv('PAYSTACK_CONNECT_TIMEOUT_SECONDS', '3.05'))
+PAYSTACK_READ_TIMEOUT_SECONDS = float(os.getenv('PAYSTACK_READ_TIMEOUT_SECONDS', '10'))
+PAYSTACK_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv('PAYSTACK_WEBHOOK_TOLERANCE_SECONDS', '300'))
+PAYSTACK_PENDING_ATTEMPT_MINUTES = int(os.getenv('PAYSTACK_PENDING_ATTEMPT_MINUTES', '15'))
 
 if not DEBUG:
     SECURE_SSL_REDIRECT = env_bool('DJANGO_SECURE_SSL_REDIRECT', True)

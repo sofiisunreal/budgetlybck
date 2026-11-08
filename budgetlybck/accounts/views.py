@@ -1,11 +1,18 @@
 from rest_framework import generics
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.views import APIView
 
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .serializers import RegisterSerializer, UserSerializer,ChangePasswordSerializer, ForgotPasswordSerializer, ResetPasswordSerializer, DeleteAccountSerializer
+from .serializers import (ChangePasswordSerializer, DeleteAccountSerializer,
+                          ForgotPasswordSerializer, PolicyAcceptanceSerializer,
+                          PolicyDocumentSerializer, RegisterSerializer,
+                          ResetPasswordSerializer, UserSerializer,
+                          validate_active_document_identities)
+from .models import PolicyAcceptance, PolicyDocument
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.encoding import force_bytes
@@ -16,11 +23,36 @@ from django.utils.http import urlsafe_base64_decode
 from django.conf import settings
 from django.db import transaction
 from django.db.models.deletion import ProtectedError
+from django.core.exceptions import ValidationError
 import logging
 
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
+
+
+def active_policy_documents_response():
+    """Return active documents or a safe, explicit unavailable response."""
+    try:
+        documents = PolicyDocument.active_documents()
+    except ValidationError:
+        documents = None
+    if documents is None:
+        return None
+    return documents
+
+
+def current_policy_acceptances(user, documents):
+    acceptances = PolicyAcceptance.objects.filter(
+        user=user, document__in=documents.values()
+    ).select_related('document')
+    return {
+        acceptance.document.document_type: {
+            'document': PolicyDocumentSerializer(acceptance.document).data,
+            'accepted_at': acceptance.accepted_at,
+        }
+        for acceptance in acceptances
+    }
 
 
 def delete_user_financial_records(user):
@@ -77,9 +109,93 @@ class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
 
+    def create(self, request, *args, **kwargs):
+        if active_policy_documents_response() is None:
+            return Response(
+                {'detail': 'Legal documents are not currently available for registration.', 'code': 'legal_documents_unavailable'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return super().create(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         user = serializer.save()
         transaction.on_commit(lambda: send_welcome_email(user))
+
+
+class ActivePolicyDocumentsView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        documents = active_policy_documents_response()
+        if documents is None:
+            return Response(
+                {'detail': 'Legal documents are not currently available.', 'code': 'legal_documents_unavailable'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return Response({
+            'terms': PolicyDocumentSerializer(documents[PolicyDocument.TERMS]).data,
+            'privacy': PolicyDocumentSerializer(documents[PolicyDocument.PRIVACY]).data,
+        })
+
+
+class LegalAcceptanceStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        documents = active_policy_documents_response()
+        if documents is None:
+            return Response({
+                'documents_available': False,
+                'acceptance_required': False,
+                'reason': 'legal_documents_unavailable',
+                'documents': None,
+                'acceptances': {},
+            })
+
+        acceptances = current_policy_acceptances(request.user, documents)
+        active_ids = {document.id for document in documents.values()}
+        return Response({
+            'documents_available': True,
+            'acceptance_required': set(
+                acceptance['document']['id'] for acceptance in acceptances.values()
+            ) != active_ids,
+            'documents': {
+                'terms': PolicyDocumentSerializer(documents[PolicyDocument.TERMS]).data,
+                'privacy': PolicyDocumentSerializer(documents[PolicyDocument.PRIVACY]).data,
+            },
+            'acceptances': acceptances,
+        })
+
+
+class PolicyAcceptanceView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = PolicyAcceptanceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            user = User.objects.select_for_update().get(pk=request.user.pk)
+            documents = validate_active_document_identities(
+                serializer.validated_data['terms_document'],
+                serializer.validated_data['privacy_document'],
+            )
+            created = False
+            for document in documents.values():
+                _, was_created = PolicyAcceptance.objects.get_or_create(user=user, document=document)
+                created = created or was_created
+
+        return Response(
+            {
+                'acceptance_required': False,
+                'documents': {
+                    'terms': PolicyDocumentSerializer(documents[PolicyDocument.TERMS]).data,
+                    'privacy': PolicyDocumentSerializer(documents[PolicyDocument.PRIVACY]).data,
+                },
+                'acceptances': current_policy_acceptances(user, documents),
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
 
 
 class ProfileView(generics.RetrieveUpdateAPIView):

@@ -9,7 +9,7 @@ from unittest.mock import patch
 import hashlib
 from rest_framework import status
 from rest_framework.test import APITestCase, APIRequestFactory, force_authenticate
-from .views import DeleteAccountView, ForgotPasswordView, RegisterView, send_welcome_email
+from .views import ActivePolicyDocumentsView, DeleteAccountView, ForgotPasswordView, RegisterView, send_welcome_email
 from .models import PolicyAcceptance, PolicyDocument
 from budget.models import Account, Budget, Category, Loan, LoanRepayment, Transaction, Transfer
 from feedback.models import Feedback
@@ -31,24 +31,7 @@ class RegistrationLegalAcceptanceTests(APITestCase):
         data.update(overrides)
         return data
 
-    def test_registration_records_server_controlled_legal_acceptance(self):
-        response = self.client.post(self.url, self.payload(), format="json")
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        user = User.objects.get(email="new-user@example.com")
-        self.assertTrue(user.age_eligibility_confirmed)
-        self.assertIsNotNone(user.terms_accepted_at)
-        self.assertIsNotNone(user.privacy_policy_accepted_at)
-        self.assertEqual(user.accepted_policy_version, settings.LEGAL_POLICY_VERSION)
-
-    def test_registration_requires_each_legal_declaration(self):
-        response = self.client.post(self.url, self.payload(accept_terms=False), format="json")
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("accept_terms", response.data)
-        self.assertFalse(User.objects.filter(email="new-user@example.com").exists())
-
-    def test_active_documents_create_acceptances_for_the_exact_documents(self):
+    def activate_documents(self):
         terms = PolicyDocument.objects.create(
             document_type=PolicyDocument.TERMS,
             version="1.0",
@@ -61,8 +44,50 @@ class RegistrationLegalAcceptanceTests(APITestCase):
             content="Privacy Policy v1.0",
             is_active=True,
         )
+        return terms, privacy
 
-        response = self.client.post(self.url, self.payload(), format="json")
+    def identity(self, document):
+        return {"id": document.id, "version": document.version, "content_sha256": document.content_sha256}
+
+    def test_registration_records_server_controlled_legal_acceptance(self):
+        terms, privacy = self.activate_documents()
+        response = self.client.post(
+            self.url,
+            self.payload(terms_document=self.identity(terms), privacy_document=self.identity(privacy)),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        user = User.objects.get(email="new-user@example.com")
+        self.assertTrue(user.age_eligibility_confirmed)
+        self.assertIsNotNone(user.terms_accepted_at)
+        self.assertIsNotNone(user.privacy_policy_accepted_at)
+        self.assertEqual(user.accepted_policy_version, settings.LEGAL_POLICY_VERSION)
+
+    def test_registration_requires_each_legal_declaration(self):
+        terms, privacy = self.activate_documents()
+        response = self.client.post(
+            self.url,
+            self.payload(
+                accept_terms=False,
+                terms_document=self.identity(terms),
+                privacy_document=self.identity(privacy),
+            ),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("accept_terms", response.data)
+        self.assertFalse(User.objects.filter(email="new-user@example.com").exists())
+
+    def test_active_documents_create_acceptances_for_the_exact_documents(self):
+        terms, privacy = self.activate_documents()
+
+        response = self.client.post(
+            self.url,
+            self.payload(terms_document=self.identity(terms), privacy_document=self.identity(privacy)),
+            format="json",
+        )
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         user = User.objects.get(email="new-user@example.com")
@@ -79,18 +104,7 @@ class RegistrationLegalAcceptanceTests(APITestCase):
             accepted_policy_version="1.0",
         )
         original_version = user.accepted_policy_version
-        PolicyDocument.objects.create(
-            document_type=PolicyDocument.TERMS,
-            version="1.0",
-            content="Terms of Service v1.0",
-            is_active=True,
-        )
-        PolicyDocument.objects.create(
-            document_type=PolicyDocument.PRIVACY,
-            version="1.0",
-            content="Privacy Policy v1.0",
-            is_active=True,
-        )
+        self.activate_documents()
 
         user.refresh_from_db()
 
@@ -105,9 +119,29 @@ class RegistrationLegalAcceptanceTests(APITestCase):
             is_active=True,
         )
 
-        response = self.client.post(self.url, self.payload(), format="json")
+        response = RegisterView.as_view()(
+            APIRequestFactory().post(self.url, self.payload(), format="json")
+        )
 
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertFalse(User.objects.filter(email="new-user@example.com").exists())
+
+    def test_registration_rejects_missing_or_stale_document_identity(self):
+        terms, privacy = self.activate_documents()
+        missing = self.client.post(self.url, self.payload(), format="json")
+        stale = self.client.post(
+            self.url,
+            self.payload(
+                terms_document={**self.identity(terms), "content_sha256": "0" * 64},
+                privacy_document=self.identity(privacy),
+            ),
+            format="json",
+        )
+
+        self.assertEqual(missing.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("terms_document", missing.data)
+        self.assertEqual(stale.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("terms_document", stale.data)
         self.assertFalse(User.objects.filter(email="new-user@example.com").exists())
 
     def test_accepted_document_content_cannot_be_changed(self):
@@ -122,6 +156,77 @@ class RegistrationLegalAcceptanceTests(APITestCase):
 
         with self.assertRaises(ValidationError):
             document.save()
+
+
+class LegalPolicyApiTests(APITestCase):
+    documents_url = "/api/auth/legal-documents/"
+    status_url = "/api/auth/legal-status/"
+    acceptances_url = "/api/auth/legal-acceptances/"
+
+    def activate_documents(self):
+        terms = PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS,
+            version="1.0",
+            content="Terms of Service v1.0",
+            is_active=True,
+        )
+        privacy = PolicyDocument.objects.create(
+            document_type=PolicyDocument.PRIVACY,
+            version="1.0",
+            content="Privacy Policy v1.0",
+            is_active=True,
+        )
+        return terms, privacy
+
+    def identities(self, terms, privacy):
+        return {
+            "terms_document": {"id": terms.id, "version": terms.version, "content_sha256": terms.content_sha256},
+            "privacy_document": {"id": privacy.id, "version": privacy.version, "content_sha256": privacy.content_sha256},
+        }
+
+    def test_public_documents_are_unavailable_until_a_complete_pair_is_active(self):
+        response = ActivePolicyDocumentsView.as_view()(APIRequestFactory().get(self.documents_url))
+        unauthenticated_acceptance = self.client.post(self.acceptances_url, {}, format="json")
+        user = User.objects.create_user("status-user", "status@example.com", "SafePassword123!")
+        self.client.force_authenticate(user=user)
+        pending_status = self.client.get(self.status_url)
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.data["code"], "legal_documents_unavailable")
+        self.assertEqual(unauthenticated_acceptance.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertFalse(pending_status.data["documents_available"])
+        self.assertFalse(pending_status.data["acceptance_required"])
+
+    def test_public_documents_return_exact_text_hash_and_dates(self):
+        terms, privacy = self.activate_documents()
+
+        response = self.client.get(self.documents_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["terms"]["id"], terms.id)
+        self.assertEqual(response.data["terms"]["content"], terms.content)
+        self.assertEqual(response.data["terms"]["content_sha256"], terms.content_sha256)
+        self.assertEqual(response.data["terms"]["effective_at"], response.data["terms"]["published_at"])
+        self.assertEqual(response.data["privacy"]["id"], privacy.id)
+
+    def test_existing_user_can_explicitly_accept_and_duplicate_is_idempotent(self):
+        terms, privacy = self.activate_documents()
+        user = User.objects.create_user("pending-user", "pending@example.com", "SafePassword123!")
+        other_user = User.objects.create_user("other-user", "other@example.com", "SafePassword123!")
+        self.client.force_authenticate(user=user)
+
+        pending = self.client.get(self.status_url)
+        first = self.client.post(self.acceptances_url, self.identities(terms, privacy), format="json")
+        second = self.client.post(self.acceptances_url, self.identities(terms, privacy), format="json")
+        current = self.client.get(self.status_url)
+
+        self.assertTrue(pending.data["acceptance_required"])
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertFalse(current.data["acceptance_required"])
+        self.assertIn("accepted_at", first.data["acceptances"]["terms"])
+        self.assertEqual(PolicyAcceptance.objects.filter(user=user).count(), 2)
+        self.assertFalse(PolicyAcceptance.objects.filter(user=other_user).exists())
 
 
 @override_settings(
@@ -178,9 +283,15 @@ class PasswordResetTests(APITestCase):
 class WelcomeEmailTests(TransactionTestCase):
     def setUp(self):
         self.factory = APIRequestFactory()
+        self.terms = PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS, version="1.0", content="Terms", is_active=True
+        )
+        self.privacy = PolicyDocument.objects.create(
+            document_type=PolicyDocument.PRIVACY, version="1.0", content="Privacy", is_active=True
+        )
 
     def payload(self, **overrides):
-        value = {"username": "welcome-user", "email": "welcome@example.com", "password": "SafePassword123!", "password_confirm": "SafePassword123!", "age_eligibility": True, "accept_terms": True, "accept_privacy_policy": True, "first_name": "Amina"}
+        value = {"username": "welcome-user", "email": "welcome@example.com", "password": "SafePassword123!", "password_confirm": "SafePassword123!", "age_eligibility": True, "accept_terms": True, "accept_privacy_policy": True, "first_name": "Amina", "terms_document": {"id": self.terms.id, "version": self.terms.version, "content_sha256": self.terms.content_sha256}, "privacy_document": {"id": self.privacy.id, "version": self.privacy.version, "content_sha256": self.privacy.content_sha256}}
         value.update(overrides)
         return value
 
@@ -341,3 +452,17 @@ class AccountDeletionTests(APITestCase):
         self.assertTrue(Account.objects.filter(pk=self.account.pk).exists())
         foreign_goal.refresh_from_db()
         self.assertEqual(foreign_goal.account_id, self.account.pk)
+
+    def test_deletion_remains_available_when_current_policy_acceptance_is_pending(self):
+        self.terms_document.is_active = True
+        self.terms_document.save()
+        self.privacy_document.is_active = True
+        self.privacy_document.save()
+        pending_user = User.objects.create_user("pending-delete", "pending-delete@example.com", "SafePassword123!")
+        request = self.factory.delete("/api/auth/delete-account/", {"password": "SafePassword123!"}, format="json")
+        force_authenticate(request, user=pending_user)
+
+        response = DeleteAccountView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(User.objects.filter(pk=pending_user.pk).exists())
