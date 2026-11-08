@@ -1,4 +1,5 @@
 from django.core.exceptions import ValidationError
+from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
@@ -45,12 +46,21 @@ def apply_verification(reference, provider_data):
         attempt.save(update_fields=['status', 'provider_transaction_id', 'provider_metadata', 'verified_at', 'updated_at'])
         if mapped_status != PaystackPurchaseAttempt.SUCCESSFUL:
             return attempt, None, False
-        entitlement = LifetimeAccessEntitlement.objects.select_for_update().filter(user=attempt.user).first()
+        # A payment can complete after its user has deleted their account. Keep
+        # the verified payment evidence, but never recreate an entitlement for
+        # a deleted account.
+        if attempt.user_id is None:
+            return attempt, None, False
+        user = get_user_model().objects.select_for_update().filter(pk=attempt.user_id).first()
+        if user is None:
+            return attempt, None, False
+
+        entitlement = LifetimeAccessEntitlement.objects.select_for_update().filter(user=user).first()
         if entitlement:
             return attempt, entitlement, False
         try:
             entitlement = LifetimeAccessEntitlement.objects.create(
-                user=attempt.user, source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE, activating_purchase=attempt
+                user=user, source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE, activating_purchase=attempt
             )
         except IntegrityError:
             entitlement = LifetimeAccessEntitlement.objects.select_for_update().get(user=attempt.user)

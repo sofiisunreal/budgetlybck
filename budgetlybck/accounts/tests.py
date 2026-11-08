@@ -18,6 +18,9 @@ from .models import PolicyAcceptance, PolicyDocument
 from budget.models import Account, Budget, Category, Loan, LoanRepayment, Transaction, Transfer
 from feedback.models import Feedback
 from savings.models import SavingsContribution, SavingsGoal, SavingsPlan, SavingsWithdrawal
+from billing.models import LifetimeAccessEntitlement, LifetimeAccessOffer, PaystackPurchaseAttempt
+from billing.services.access import apply_verification
+from rest_framework_simplejwt.tokens import AccessToken
 
 
 User = get_user_model()
@@ -458,6 +461,20 @@ class AccountDeletionTests(APITestCase):
         force_authenticate(request, user=self.user)
         return DeleteAccountView.as_view()(request)
 
+    def billing_offer(self):
+        return LifetimeAccessOffer.objects.create(
+            name="Account deletion test offer", price_minor=105000, currency="KES"
+        )
+
+    def purchase_attempt(self, status=PaystackPurchaseAttempt.INITIALIZED):
+        return PaystackPurchaseAttempt.objects.create(
+            user=self.user,
+            offer=self.billing_offer(),
+            expected_amount_minor=105000,
+            expected_currency="KES",
+            status=status,
+        )
+
     def test_empty_account_deletion_succeeds(self):
         empty_user = User.objects.create_user("empty-user", "empty@example.com", "SafePassword123!")
         request = self.factory.delete("/api/auth/delete-account/", {"password": "SafePassword123!"}, format="json")
@@ -555,3 +572,84 @@ class AccountDeletionTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(User.objects.filter(pk=pending_user.pk).exists())
+
+    def test_failed_or_pending_purchase_attempt_is_retained_without_user(self):
+        failed = self.purchase_attempt(PaystackPurchaseAttempt.FAILED)
+        pending = PaystackPurchaseAttempt.objects.create(
+            user=self.user, offer=failed.offer, expected_amount_minor=105000,
+            expected_currency="KES", status=PaystackPurchaseAttempt.PENDING,
+        )
+
+        response = self.delete_request()
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        failed.refresh_from_db()
+        pending.refresh_from_db()
+        self.assertEqual((failed.user_id, failed.status), (None, PaystackPurchaseAttempt.FAILED))
+        self.assertEqual((pending.user_id, pending.status), (None, PaystackPurchaseAttempt.PENDING))
+
+    def test_successful_purchase_is_retained_but_its_entitlement_is_removed(self):
+        attempt = self.purchase_attempt(PaystackPurchaseAttempt.SUCCESSFUL)
+        entitlement = LifetimeAccessEntitlement.objects.create(
+            user=self.user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=attempt,
+        )
+
+        response = self.delete_request()
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        attempt.refresh_from_db()
+        self.assertIsNone(attempt.user_id)
+        self.assertEqual(attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertFalse(LifetimeAccessEntitlement.objects.filter(pk=entitlement.pk).exists())
+
+    def test_founding_user_entitlement_is_deleted_with_the_user(self):
+        entitlement, _ = LifetimeAccessEntitlement.grant_legacy_access(self.user)
+
+        response = self.delete_request()
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(LifetimeAccessEntitlement.objects.filter(pk=entitlement.pk).exists())
+
+    def test_late_success_for_deleted_pending_account_is_reconciled_without_access(self):
+        attempt = self.purchase_attempt(PaystackPurchaseAttempt.PENDING)
+        self.assertEqual(self.delete_request().status_code, status.HTTP_204_NO_CONTENT)
+
+        verified, entitlement, activated = apply_verification(attempt.reference, {
+            "id": 222,
+            "reference": attempt.reference,
+            "status": "success",
+            "amount": 105000,
+            "currency": "KES",
+        })
+
+        self.assertEqual(verified.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertIsNone(verified.user_id)
+        self.assertIsNone(entitlement)
+        self.assertFalse(activated)
+        self.assertFalse(LifetimeAccessEntitlement.objects.exists())
+
+    def test_second_request_with_stale_token_is_unauthorized(self):
+        token = AccessToken.for_user(self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+        first = self.client.delete("/api/auth/delete-account/", {"password": "SafePassword123!"}, format="json")
+        second = self.client.delete("/api/auth/delete-account/", {"password": "SafePassword123!"}, format="json")
+
+        self.assertEqual(first.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(second.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_authenticated_user_cannot_target_another_users_account(self):
+        request = self.factory.delete(
+            "/api/auth/delete-account/",
+            {"password": "not-the-authenticated-users-password"},
+            format="json",
+        )
+        force_authenticate(request, user=self.other_user)
+
+        response = DeleteAccountView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+        self.assertTrue(User.objects.filter(pk=self.other_user.pk).exists())

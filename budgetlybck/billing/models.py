@@ -70,7 +70,16 @@ class PaystackPurchaseAttempt(models.Model):
         (FAILED, 'Failed'), (ABANDONED, 'Abandoned'), (REVERSED, 'Reversed'),
     ]
 
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='paystack_purchase_attempts')
+    # Retain payment evidence after account deletion without retaining the
+    # account or its personal data. A null user means the account was deleted;
+    # the attempt may still be reconciled by its provider reference.
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='paystack_purchase_attempts',
+    )
     reference = models.CharField(max_length=80, unique=True, default=generate_purchase_reference, editable=False)
     offer = models.ForeignKey(LifetimeAccessOffer, on_delete=models.PROTECT, related_name='purchase_attempts')
     expected_amount_minor = models.PositiveBigIntegerField()
