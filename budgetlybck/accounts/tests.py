@@ -20,7 +20,7 @@ from feedback.models import Feedback
 from savings.models import SavingsContribution, SavingsGoal, SavingsPlan, SavingsWithdrawal
 from billing.models import LifetimeAccessEntitlement, LifetimeAccessOffer, PaystackPurchaseAttempt
 from billing.services.access import apply_verification
-from rest_framework_simplejwt.tokens import AccessToken
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 
 
 User = get_user_model()
@@ -523,7 +523,7 @@ class AccountDeletionTests(APITestCase):
         self.assertTrue(SavingsGoal.objects.filter(pk=self.goal.pk).exists())
 
     def test_failure_rolls_back_all_deletions(self):
-        with patch("feedback.models.Feedback.objects.filter", side_effect=RuntimeError("forced failure")):
+        with patch("accounts.services.account_deletion.delete_user_financial_records", side_effect=RuntimeError("forced failure")):
             with self.assertLogs("accounts.views", level="ERROR"):
                 response = self.delete_request()
 
@@ -558,6 +558,29 @@ class AccountDeletionTests(APITestCase):
         self.assertTrue(Account.objects.filter(pk=self.account.pk).exists())
         foreign_goal.refresh_from_db()
         self.assertEqual(foreign_goal.account_id, self.account.pk)
+
+    def test_cross_user_financial_reference_returns_conflict_without_changes(self):
+        foreign_transaction = Transaction.objects.create(
+            user=self.other_user,
+            account=self.account,
+            category=self.other_category,
+            transaction_type="expense",
+            description="Invalid foreign reference",
+            amount="5.00",
+            transaction_date="2026-01-02",
+        )
+
+        response = self.delete_request()
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+        self.assertTrue(Transaction.objects.filter(pk=foreign_transaction.pk).exists())
+
+    def test_unauthenticated_deletion_is_rejected(self):
+        response = self.client.delete("/api/auth/delete-account/", {"password": "SafePassword123!"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
 
     def test_deletion_remains_available_when_current_policy_acceptance_is_pending(self):
         self.terms_document.is_active = True
@@ -639,6 +662,16 @@ class AccountDeletionTests(APITestCase):
 
         self.assertEqual(first.status_code, status.HTTP_204_NO_CONTENT)
         self.assertEqual(second.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_deletion_blacklists_refresh_token(self):
+        refresh = RefreshToken.for_user(self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {AccessToken.for_user(self.user)}")
+
+        response = self.client.delete("/api/auth/delete-account/", {"password": "SafePassword123!"}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        refresh_response = self.client.post("/api/auth/token/refresh/", {"refresh": str(refresh)}, format="json")
+        self.assertEqual(refresh_response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_authenticated_user_cannot_target_another_users_account(self):
         request = self.factory.delete(

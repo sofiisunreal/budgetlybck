@@ -26,6 +26,8 @@ from django.db.models.deletion import ProtectedError
 from django.core.exceptions import ValidationError
 import logging
 
+from .services.account_deletion import delete_user_account
+
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
@@ -53,41 +55,6 @@ def current_policy_acceptances(user, documents):
         }
         for acceptance in acceptances
     }
-
-
-def delete_user_financial_records(user):
-    """Delete only this user's dependent records, in FK-safe order."""
-    from budget.models import Account, Budget, Category, Loan, LoanRepayment, Transaction, Transfer
-    from feedback.models import Feedback
-    from savings.models import SavingsContribution, SavingsGoal, SavingsPlan, SavingsWithdrawal
-
-    # Lock the accounts before deleting records that affect their calculated
-    # balances. This also makes concurrent writes that reference an account
-    # wait for the deletion transaction to finish on databases that support
-    # row-level locking.
-    list(Account.objects.select_for_update().filter(user=user).only('pk'))
-
-    # A savings goal owned by someone else would otherwise be silently
-    # retained with its account set to NULL. Such a cross-user link should be
-    # repaired explicitly, not changed as a side effect of self-service
-    # deletion.
-    foreign_goals = SavingsGoal.objects.exclude(user=user).filter(account__user=user)
-    if foreign_goals.exists():
-        raise ProtectedError('Accounts are referenced by another user\'s savings goal.', [])
-
-    SavingsPlan.objects.filter(goal__user=user).delete()
-    SavingsWithdrawal.objects.filter(goal__user=user).delete()
-    SavingsContribution.objects.filter(goal__user=user).delete()
-    SavingsGoal.objects.filter(user=user).delete()
-
-    LoanRepayment.objects.filter(loan__user=user).delete()
-    Loan.objects.filter(user=user).delete()
-    Transfer.objects.filter(user=user).delete()
-    Transaction.objects.filter(user=user).delete()
-    Budget.objects.filter(user=user).delete()
-    Feedback.objects.filter(user=user).delete()
-    Category.objects.filter(user=user).delete()
-    Account.objects.filter(user=user).delete()
 
 
 def send_welcome_email(user):
@@ -366,10 +333,7 @@ class DeleteAccountView(generics.GenericAPIView):
             )
 
         try:
-            with transaction.atomic():
-                user = User.objects.select_for_update().get(pk=request.user.pk)
-                delete_user_financial_records(user)
-                user.delete()
+            delete_user_account(request.user.pk)
         except ProtectedError:
             return Response(
                 {'detail': 'Account deletion could not be completed because protected records remain.'},
