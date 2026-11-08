@@ -2,11 +2,15 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core import mail
+from django.core.management import call_command, CommandError
 from django.test import override_settings
 from django.test import TransactionTestCase
 from django.db import transaction
 from unittest.mock import patch
 import hashlib
+import tempfile
+from io import StringIO
+from pathlib import Path
 from rest_framework import status
 from rest_framework.test import APITestCase, APIRequestFactory, force_authenticate
 from .views import ActivePolicyDocumentsView, DeleteAccountView, ForgotPasswordView, RegisterView, send_welcome_email
@@ -156,6 +160,91 @@ class RegistrationLegalAcceptanceTests(APITestCase):
 
         with self.assertRaises(ValidationError):
             document.save()
+
+    def test_unaccepted_document_content_cannot_be_changed(self):
+        document = PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS, version="draft-1.0", content="Original terms"
+        )
+        document.content = "Replacement terms"
+
+        with self.assertRaises(ValidationError):
+            document.save()
+
+
+class PolicyPublicationCommandTests(APITestCase):
+    def setUp(self):
+        self.files = tempfile.TemporaryDirectory()
+        self.terms_path = Path(self.files.name) / "terms.md"
+        self.privacy_path = Path(self.files.name) / "privacy.md"
+        self.terms_path.write_text("# Terms\n\nExact v1 text.\n", encoding="utf-8")
+        self.privacy_path.write_text("# Privacy\n\nExact v1 text.\n", encoding="utf-8")
+        self.terms_content = self.read_exact(self.terms_path)
+        self.privacy_content = self.read_exact(self.privacy_path)
+        self.base_arguments = [
+            "--terms-file", str(self.terms_path),
+            "--privacy-file", str(self.privacy_path),
+            "--policy-version", "1.0",
+            "--effective-at", "2025-12-01T00:00:00Z",
+        ]
+
+    def tearDown(self):
+        self.files.cleanup()
+
+    @staticmethod
+    def read_exact(path):
+        with path.open("r", encoding="utf-8", newline="") as source:
+            return source.read()
+
+    def run_command(self, *arguments):
+        output = StringIO()
+        call_command("publish_policy_documents", *self.base_arguments, *arguments, stdout=output)
+        return output.getvalue()
+
+    def test_imports_exact_inactive_pair_and_is_idempotent(self):
+        self.run_command()
+        self.run_command()
+
+        terms = PolicyDocument.objects.get(document_type=PolicyDocument.TERMS, version="1.0")
+        privacy = PolicyDocument.objects.get(document_type=PolicyDocument.PRIVACY, version="1.0")
+        self.assertEqual(PolicyDocument.objects.count(), 2)
+        self.assertEqual(terms.content, self.terms_content)
+        self.assertEqual(terms.content_sha256, hashlib.sha256(terms.content.encode("utf-8")).hexdigest())
+        self.assertEqual(privacy.content_sha256, hashlib.sha256(privacy.content.encode("utf-8")).hexdigest())
+        self.assertFalse(terms.is_active)
+        self.assertFalse(privacy.is_active)
+
+    def test_dry_run_and_activation_confirmation_do_not_change_records(self):
+        self.run_command("--dry-run")
+        self.assertFalse(PolicyDocument.objects.exists())
+
+    def test_rejects_early_activation_of_a_future_effective_pair(self):
+        future_arguments = [
+            "--terms-file", str(self.terms_path),
+            "--privacy-file", str(self.privacy_path),
+            "--policy-version", "future-1.0",
+            "--effective-at", "2099-12-01T00:00:00Z",
+            "--activate", "--confirm-activate", "ACTIVATE",
+        ]
+        with self.assertRaises(CommandError):
+            call_command("publish_policy_documents", *future_arguments)
+        self.assertFalse(PolicyDocument.objects.exists())
+        with self.assertRaises(CommandError):
+            self.run_command("--activate")
+        self.assertFalse(PolicyDocument.objects.exists())
+
+    def test_activates_both_documents_only_with_explicit_confirmation(self):
+        self.run_command("--activate", "--confirm-activate", "ACTIVATE")
+
+        self.assertEqual(PolicyDocument.objects.filter(is_active=True).count(), 2)
+        self.assertIsNotNone(PolicyDocument.active_documents())
+
+    def test_rejects_content_mismatch_for_existing_version(self):
+        self.run_command()
+        self.terms_path.write_text("# Terms\n\nChanged v1 text.\n", encoding="utf-8")
+
+        with self.assertRaises(CommandError):
+            self.run_command()
+        self.assertEqual(PolicyDocument.objects.get(document_type=PolicyDocument.TERMS).content, self.terms_content)
 
 
 class LegalPolicyApiTests(APITestCase):

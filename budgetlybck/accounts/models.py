@@ -45,11 +45,11 @@ class PolicyDocument(models.Model):
     def save(self, *args, **kwargs):
         if self.pk:
             previous = type(self).objects.get(pk=self.pk)
-            if PolicyAcceptance.objects.filter(document_id=self.pk).exists() and any(
+            if any(
                 getattr(previous, field) != getattr(self, field)
                 for field in ('document_type', 'version', 'content')
             ):
-                raise ValidationError('Accepted policy documents cannot be changed.')
+                raise ValidationError('Published policy document text and identity cannot be changed.')
 
         self.content_sha256 = hashlib.sha256(self.content.encode('utf-8')).hexdigest()
         if self.is_active and self.published_at is None:
