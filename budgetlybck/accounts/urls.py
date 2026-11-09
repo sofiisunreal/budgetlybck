@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (ActivePolicyDocumentsView, ChangePasswordView,
                     DeleteAccountView, ForgotPasswordView,
+                    GoogleAuthenticationView, GoogleIdentityLinkView,
                     LegalAcceptanceStatusView, LogoutView,
                     PolicyAcceptanceView, ProfileView, RegisterView,
                     ResetPasswordView)
@@ -17,6 +18,8 @@ urlpatterns = [
     path('legal-status/', LegalAcceptanceStatusView.as_view(), name='legal-status'),
     path('legal-acceptances/', PolicyAcceptanceView.as_view(), name='legal-acceptances'),
     path('register/', RegisterView.as_view(), name='register'),
+    path('google/', GoogleAuthenticationView.as_view(), name='google-authentication'),
+    path('google/link/', GoogleIdentityLinkView.as_view(), name='google-identity-link'),
     path('login/', TokenObtainPairView.as_view(), name='login'),
     path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('profile/', ProfileView.as_view(), name='profile'),

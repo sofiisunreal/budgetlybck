@@ -218,3 +218,33 @@ class DeleteAccountSerializer(serializers.Serializer):
         write_only=True,
         required=True
     )
+
+
+class GoogleAuthenticationSerializer(serializers.Serializer):
+    credential = serializers.CharField(write_only=True, trim_whitespace=True, max_length=12000)
+    age_eligibility = serializers.BooleanField(write_only=True, required=False)
+    accept_terms = serializers.BooleanField(write_only=True, required=False)
+    accept_privacy_policy = serializers.BooleanField(write_only=True, required=False)
+    terms_document = PolicyDocumentIdentitySerializer(write_only=True, required=False)
+    privacy_document = PolicyDocumentIdentitySerializer(write_only=True, required=False)
+
+    def legal_identities(self):
+        """Return supplied new-user acceptance data, or None for linked login."""
+        declarations = ('age_eligibility', 'accept_terms', 'accept_privacy_policy')
+        legal_fields = (*declarations, 'terms_document', 'privacy_document')
+        supplied = any(field in self.initial_data for field in legal_fields)
+        if not supplied:
+            return None
+        errors = {
+            field: 'This field is required.'
+            for field in declarations if self.validated_data.get(field) is not True
+        }
+        for field in ('terms_document', 'privacy_document'):
+            if self.validated_data.get(field) is None:
+                errors[field] = 'This field is required.'
+        if errors:
+            raise serializers.ValidationError(errors)
+        return {
+            'terms_document': self.validated_data['terms_document'],
+            'privacy_document': self.validated_data['privacy_document'],
+        }

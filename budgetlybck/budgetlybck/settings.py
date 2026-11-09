@@ -177,6 +177,8 @@ REST_FRAMEWORK = {
 
 REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'] = {
     'feedback': os.getenv('DJANGO_FEEDBACK_THROTTLE_RATE', '5/hour'),
+    'google_auth': os.getenv('DJANGO_GOOGLE_AUTH_THROTTLE_RATE', '10/minute'),
+    'google_link': os.getenv('DJANGO_GOOGLE_LINK_THROTTLE_RATE', '10/minute'),
 }
 
 
@@ -206,6 +208,10 @@ FRONTEND_PASSWORD_RESET_URL = os.getenv(
     'DJANGO_FRONTEND_PASSWORD_RESET_URL', 'http://localhost:5173/reset-password'
 )
 FRONTEND_APP_URL = os.getenv('DJANGO_FRONTEND_APP_URL', 'http://localhost:5173')
+
+# Comma-separated OAuth 2.0 Web client IDs allowed to present Google ID tokens.
+# Credentials and client secrets are never used by this ID-token-only flow.
+GOOGLE_OAUTH_CLIENT_IDS = env_list('GOOGLE_OAUTH_CLIENT_IDS')
 
 # Billing foundation. Checkout and webhook code are intentionally not enabled
 # in this phase; these values seed and validate the server-owned offer only.

@@ -82,3 +82,14 @@ class PolicyAcceptance(models.Model):
             models.UniqueConstraint(fields=['user', 'document'], name='unique_user_policy_acceptance'),
         ]
         ordering = ['-accepted_at']
+
+
+class GoogleIdentity(models.Model):
+    """The minimum durable link between a Budgetly user and Google identity."""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='google_identity')
+    subject = models.CharField(max_length=255, unique=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f'Google identity for user {self.user_id}'

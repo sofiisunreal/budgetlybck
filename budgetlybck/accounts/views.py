@@ -3,6 +3,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.views import APIView
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -11,6 +12,7 @@ from .serializers import (ChangePasswordSerializer, DeleteAccountSerializer,
                           ForgotPasswordSerializer, PolicyAcceptanceSerializer,
                           PolicyDocumentSerializer, RegisterSerializer,
                           ResetPasswordSerializer, UserSerializer,
+                          GoogleAuthenticationSerializer,
                           validate_active_document_identities)
 from .models import PolicyAcceptance, PolicyDocument
 from django.contrib.auth import get_user_model
@@ -27,10 +29,21 @@ from django.core.exceptions import ValidationError
 import logging
 
 from .services.account_deletion import delete_user_account
+from .services.google_auth import (GoogleConfigurationError, GoogleCredentialError,
+                                   authenticate_or_register_google, issue_tokens,
+                                   link_google_identity, verify_google_credential)
 
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
+
+
+class GoogleAuthenticationThrottle(AnonRateThrottle):
+    scope = 'google_auth'
+
+
+class GoogleLinkThrottle(UserRateThrottle):
+    scope = 'google_link'
 
 
 def active_policy_documents_response():
@@ -87,6 +100,67 @@ class RegisterView(generics.CreateAPIView):
     def perform_create(self, serializer):
         user = serializer.save()
         transaction.on_commit(lambda: send_welcome_email(user))
+
+
+class GoogleAuthenticationView(APIView):
+    """Authenticate a linked Google identity or create a legally-consented user."""
+
+    permission_classes = [AllowAny]
+    throttle_classes = [GoogleAuthenticationThrottle]
+
+    def post(self, request):
+        serializer = GoogleAuthenticationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            claims = verify_google_credential(serializer.validated_data['credential'])
+            user, created = authenticate_or_register_google(claims, serializer.legal_identities())
+        except GoogleConfigurationError:
+            return Response({'detail': 'Google sign-in is not configured.', 'code': 'google_auth_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except GoogleCredentialError as error:
+            messages = {
+                'link_required': 'Sign in to your existing Budgetly account before linking Google.',
+                'legal_acceptance_required': 'Review and accept the current legal documents before creating an account.',
+                'identity_in_use': 'This Google identity is already linked to another account.',
+                'inactive_user': 'This account is inactive.',
+            }
+            return Response(
+                {'detail': messages.get(error.code, 'Google credential could not be verified.'), 'code': error.code},
+                status=(status.HTTP_409_CONFLICT if error.code in {'link_required', 'identity_in_use'}
+                        else status.HTTP_403_FORBIDDEN if error.code == 'inactive_user'
+                        else status.HTTP_400_BAD_REQUEST),
+            )
+        if created:
+            transaction.on_commit(lambda: send_welcome_email(user))
+        return Response(issue_tokens(user), status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+class GoogleIdentityLinkView(APIView):
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [GoogleLinkThrottle]
+
+    def post(self, request):
+        serializer = GoogleAuthenticationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            identity, created = link_google_identity(
+                request.user,
+                verify_google_credential(serializer.validated_data['credential']),
+            )
+        except GoogleConfigurationError:
+            return Response({'detail': 'Google sign-in is not configured.', 'code': 'google_auth_unavailable'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except GoogleCredentialError as error:
+            messages = {
+                'identity_in_use': 'This Google identity is already linked to another account.',
+                'user_already_linked': 'Your Budgetly account already has a Google identity linked.',
+                'inactive_user': 'This account is inactive.',
+            }
+            return Response(
+                {'detail': messages.get(error.code, 'Google credential could not be verified.'), 'code': error.code},
+                status=(status.HTTP_409_CONFLICT if error.code in {'identity_in_use', 'user_already_linked'}
+                        else status.HTTP_403_FORBIDDEN if error.code == 'inactive_user'
+                        else status.HTTP_400_BAD_REQUEST),
+            )
+        return Response({'linked': created}, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 
 class ActivePolicyDocumentsView(APIView):

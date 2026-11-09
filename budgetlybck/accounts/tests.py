@@ -1,11 +1,14 @@
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.tokens import default_token_generator
 from django.core.exceptions import ValidationError
 from django.core import mail
 from django.core.management import call_command, CommandError
 from django.test import override_settings
 from django.test import TransactionTestCase
 from django.db import transaction
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 from unittest.mock import patch
 import hashlib
 import tempfile
@@ -15,6 +18,8 @@ from rest_framework import status
 from rest_framework.test import APITestCase, APIRequestFactory, force_authenticate
 from .views import ActivePolicyDocumentsView, DeleteAccountView, ForgotPasswordView, RegisterView, send_welcome_email
 from .models import PolicyAcceptance, PolicyDocument
+from .models import GoogleIdentity
+from .services.google_auth import GoogleCredentialError, verify_google_credential
 from budget.models import Account, Budget, Category, Loan, LoanRepayment, Transaction, Transfer
 from feedback.models import Feedback
 from savings.models import SavingsContribution, SavingsGoal, SavingsPlan, SavingsWithdrawal
@@ -172,6 +177,177 @@ class RegistrationLegalAcceptanceTests(APITestCase):
 
         with self.assertRaises(ValidationError):
             document.save()
+
+
+@override_settings(GOOGLE_OAUTH_CLIENT_IDS=['google-client-id.apps.googleusercontent.com'])
+class GoogleAuthenticationTests(APITestCase):
+    url = '/api/auth/google/'
+    link_url = '/api/auth/google/link/'
+
+    def setUp(self):
+        self.terms = PolicyDocument.objects.create(
+            document_type=PolicyDocument.TERMS, version='1.0', content='Terms', is_active=True
+        )
+        self.privacy = PolicyDocument.objects.create(
+            document_type=PolicyDocument.PRIVACY, version='1.0', content='Privacy', is_active=True
+        )
+
+    def claims(self, **overrides):
+        result = {
+            'subject': 'google-subject-123',
+            'email': 'google.user@example.com',
+            'given_name': 'Google',
+            'family_name': 'User',
+        }
+        result.update(overrides)
+        return result
+
+    def legal_payload(self):
+        return {
+            'age_eligibility': True,
+            'accept_terms': True,
+            'accept_privacy_policy': True,
+            'terms_document': {'id': self.terms.id, 'version': self.terms.version, 'content_sha256': self.terms.content_sha256},
+            'privacy_document': {'id': self.privacy.id, 'version': self.privacy.version, 'content_sha256': self.privacy.content_sha256},
+        }
+
+    @patch('accounts.views.verify_google_credential')
+    def test_valid_credential_creates_user_with_legal_acceptance_and_jwt(self, verify):
+        verify.return_value = self.claims()
+
+        response = self.client.post(self.url, {'credential': 'not-logged', **self.legal_payload()}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
+        user = User.objects.get(email='google.user@example.com')
+        self.assertFalse(user.has_usable_password())
+        self.assertEqual(GoogleIdentity.objects.get(user=user).subject, 'google-subject-123')
+        self.assertEqual(PolicyAcceptance.objects.filter(user=user).count(), 2)
+        self.assertFalse(LifetimeAccessEntitlement.objects.filter(user=user).exists())
+
+    @patch('accounts.views.verify_google_credential')
+    def test_existing_linked_identity_signs_in_without_legal_resubmission(self, verify):
+        user = User.objects.create_user('linked-google', 'linked@example.com', 'SafePassword123!')
+        GoogleIdentity.objects.create(user=user, subject='google-subject-123')
+        verify.return_value = self.claims(email=user.email)
+
+        response = self.client.post(self.url, {'credential': 'not-logged'}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+        self.assertEqual(User.objects.filter(email=user.email).count(), 1)
+
+    @patch('accounts.views.verify_google_credential')
+    def test_inactive_linked_user_cannot_obtain_tokens(self, verify):
+        user = User.objects.create_user('inactive-google', 'inactive@example.com', 'SafePassword123!')
+        user.is_active = False
+        user.save(update_fields=['is_active'])
+        GoogleIdentity.objects.create(user=user, subject='google-subject-123')
+        verify.return_value = self.claims(email=user.email)
+
+        response = self.client.post(self.url, {'credential': 'not-logged'}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.data['code'], 'inactive_user')
+
+    def test_google_user_can_use_existing_password_reset_recovery(self):
+        user = User.objects.create_user('recover-google', 'recover@example.com', 'UnusedPassword123!')
+        user.set_unusable_password()
+        user.save(update_fields=['password'])
+        GoogleIdentity.objects.create(user=user, subject='recovery-google-subject')
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        token = default_token_generator.make_token(user)
+
+        response = self.client.post(
+            f'/api/auth/reset-password/{uid}/{token}/',
+            {'new_password': 'RecoveredPassword123!', 'confirm_password': 'RecoveredPassword123!'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password('RecoveredPassword123!'))
+
+    @patch('accounts.views.verify_google_credential')
+    def test_existing_password_email_requires_explicit_authenticated_link(self, verify):
+        existing = User.objects.create_user('password-user', 'google.user@example.com', 'SafePassword123!')
+        verify.return_value = self.claims()
+
+        response = self.client.post(self.url, {'credential': 'not-logged', **self.legal_payload()}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data['code'], 'link_required')
+        self.assertFalse(GoogleIdentity.objects.filter(user=existing).exists())
+
+    @patch('accounts.views.verify_google_credential')
+    def test_authenticated_user_can_link_once_and_other_user_cannot_take_identity(self, verify):
+        first = User.objects.create_user('first-user', 'first@example.com', 'SafePassword123!')
+        second = User.objects.create_user('second-user', 'second@example.com', 'SafePassword123!')
+        verify.return_value = self.claims()
+        self.client.force_authenticate(first)
+
+        created = self.client.post(self.link_url, {'credential': 'not-logged'}, format='json')
+        repeated = self.client.post(self.link_url, {'credential': 'not-logged'}, format='json')
+        self.client.force_authenticate(second)
+        conflict = self.client.post(self.link_url, {'credential': 'not-logged'}, format='json')
+
+        self.assertEqual((created.status_code, repeated.status_code, conflict.status_code), (201, 200, 409))
+        self.assertEqual(conflict.data['code'], 'identity_in_use')
+
+    @patch('accounts.views.verify_google_credential')
+    def test_user_cannot_link_a_second_google_identity(self, verify):
+        user = User.objects.create_user('one-google-user', 'one-google@example.com', 'SafePassword123!')
+        GoogleIdentity.objects.create(user=user, subject='first-google-subject')
+        verify.return_value = self.claims(subject='second-google-subject')
+        self.client.force_authenticate(user)
+
+        response = self.client.post(self.link_url, {'credential': 'not-logged'}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data['code'], 'user_already_linked')
+
+    @patch('accounts.views.verify_google_credential')
+    def test_missing_or_stale_legal_acceptance_cannot_create_google_user(self, verify):
+        verify.return_value = self.claims()
+        missing = self.client.post(self.url, {'credential': 'not-logged'}, format='json')
+        stale = self.client.post(self.url, {
+            'credential': 'not-logged',
+            **self.legal_payload(),
+            'terms_document': {'id': self.terms.id, 'version': self.terms.version, 'content_sha256': '0' * 64},
+        }, format='json')
+
+        self.assertEqual(missing.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(missing.data['code'], 'legal_acceptance_required')
+        self.assertEqual(stale.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('terms_document', stale.data)
+        self.assertFalse(User.objects.filter(email='google.user@example.com').exists())
+
+    @patch('accounts.services.google_auth._verify_with_google_auth')
+    def test_wrong_audience_issuer_or_unverified_email_is_rejected(self, verify):
+        base = {'sub': 'google-subject-123', 'email': 'google.user@example.com', 'email_verified': True, 'aud': 'google-client-id.apps.googleusercontent.com', 'iss': 'https://accounts.google.com'}
+        for overrides in (
+            {'aud': 'wrong-client'}, {'iss': 'https://issuer.example'}, {'email_verified': False}, {'sub': ''},
+        ):
+            verify.return_value = {**base, **overrides}
+            with self.assertRaises(GoogleCredentialError):
+                verify_google_credential('not-logged')
+
+    @patch('accounts.services.google_auth._verify_with_google_auth', side_effect=ValueError('expired'))
+    def test_expired_or_invalid_credential_is_rejected(self, verify):
+        with self.assertRaises(GoogleCredentialError):
+            verify_google_credential('not-logged')
+
+    @patch('accounts.views.verify_google_credential')
+    def test_account_deletion_cascades_google_identity(self, verify):
+        user = User.objects.create_user('delete-google', 'delete-google@example.com', 'SafePassword123!')
+        identity = GoogleIdentity.objects.create(user=user, subject='deletion-subject')
+        self.client.force_authenticate(user)
+
+        response = self.client.delete('/api/auth/delete-account/', {'password': 'SafePassword123!'}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(GoogleIdentity.objects.filter(pk=identity.pk).exists())
 
 
 class PolicyPublicationCommandTests(APITestCase):
