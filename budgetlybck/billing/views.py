@@ -4,12 +4,13 @@ from datetime import timedelta
 from urllib.parse import urlencode, urlparse
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.http import HttpResponseRedirect
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.exceptions import NotFound
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -32,7 +33,7 @@ def active_offer():
     offer = LifetimeAccessOffer.objects.filter(is_active=True).first()
     if not offer or offer.currency != settings.BILLING_LIFETIME_CURRENCY or offer.price_minor != settings.BILLING_LIFETIME_PRICE_MINOR:
         logger.error('Active billing offer unavailable or mismatched')
-        raise ValidationError({'detail': 'Lifetime purchase is not currently available.'})
+        raise PaystackConfigurationError('Active billing offer is unavailable or mismatched.')
     return offer
 
 
@@ -68,17 +69,19 @@ class PurchaseInitializeView(APIView):
         except PaystackConfigurationError:
             return Response({'detail': 'Payments are not configured.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        cooldown = timezone.now() - timedelta(minutes=settings.PAYSTACK_PENDING_ATTEMPT_MINUTES)
-        if PaystackPurchaseAttempt.objects.filter(
-            user=request.user,
-            status__in=[PaystackPurchaseAttempt.INITIALIZED, PaystackPurchaseAttempt.PENDING],
-            created_at__gte=cooldown,
-        ).exists():
-            return Response({'detail': 'A payment attempt is already in progress. Verify or retry after it expires.'}, status=status.HTTP_409_CONFLICT)
-
         with transaction.atomic():
+            # Serializing on the user row prevents two browser tabs or retrying
+            # clients from receiving separate checkout references concurrently.
+            user = get_user_model().objects.select_for_update().get(pk=request.user.pk)
+            cooldown = timezone.now() - timedelta(minutes=settings.PAYSTACK_PENDING_ATTEMPT_MINUTES)
+            if PaystackPurchaseAttempt.objects.filter(
+                user=user,
+                status__in=[PaystackPurchaseAttempt.INITIALIZED, PaystackPurchaseAttempt.PENDING],
+                created_at__gte=cooldown,
+            ).exists():
+                return Response({'detail': 'A payment attempt is already in progress. Verify its status before starting another checkout.'}, status=status.HTTP_409_CONFLICT)
             attempt = PaystackPurchaseAttempt.objects.create(
-                user=request.user, offer=offer, expected_amount_minor=offer.price_minor, expected_currency=offer.currency
+                user=user, offer=offer, expected_amount_minor=offer.price_minor, expected_currency=offer.currency
             )
         try:
             checkout = initialize_transaction(
@@ -86,7 +89,14 @@ class PurchaseInitializeView(APIView):
                 callback_url=config.callback_url, metadata={'purchase_reference': attempt.reference},
             )
         except PaystackError as error:
-            attempt.status = PaystackPurchaseAttempt.FAILED
+            # A timeout can occur after Paystack accepted the initialization.
+            # Keep that reference pending rather than silently creating another
+            # checkout that could expose the user to a second charge.
+            attempt.status = (
+                PaystackPurchaseAttempt.PENDING
+                if isinstance(error, PaystackUnavailableError)
+                else PaystackPurchaseAttempt.FAILED
+            )
             attempt.save(update_fields=['status', 'updated_at'])
             logger.warning('Paystack initialization failed', extra={'reference': attempt.reference, 'category': error.category})
             return Response({'detail': 'Unable to start checkout. Please try again.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)

@@ -12,13 +12,15 @@ from django.core.management import call_command
 from django.db import IntegrityError
 from django.test import TestCase, override_settings
 from django.utils import timezone
+from rest_framework import status
 from rest_framework.test import APITestCase, APIRequestFactory, force_authenticate
 
 from budget.models import Account, Category, Transaction
 from .models import (LifetimeAccessEntitlement, LifetimeAccessOffer,
                      PaystackPurchaseAttempt, PaystackWebhookEvent)
 from .permissions import has_lifetime_access
-from .services.paystack import (PaystackUnavailableError, initialize_transaction,
+from .services.paystack import (PaystackConfigurationError, PaystackUnavailableError,
+                                get_config, initialize_transaction,
                                 webhook_signature_valid)
 from .views import PaystackWebhookView, PurchaseInitializeView
 
@@ -327,6 +329,25 @@ class PaystackPhaseTwoTests(APITestCase):
         self.assertEqual(response.status_code, 503)
         self.assertFalse(PaystackPurchaseAttempt.objects.exists())
 
+    @patch('billing.views.initialize_transaction', side_effect=PaystackUnavailableError('timeout'))
+    def test_ambiguous_initialization_stays_pending_and_blocks_a_second_checkout(self, initialize):
+        first = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+        attempt = PaystackPurchaseAttempt.objects.get(user=self.user)
+        second = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+
+        self.assertEqual((first.status_code, second.status_code), (503, 409))
+        self.assertEqual(attempt.status, PaystackPurchaseAttempt.PENDING)
+        self.assertEqual(initialize.call_count, 1)
+
+    @patch('billing.views.initialize_transaction')
+    def test_missing_or_mismatched_active_offer_is_a_safe_configuration_error(self, initialize):
+        self.offer.delete()
+
+        response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        initialize.assert_not_called()
+
     @patch('billing.views.initialize_transaction')
     def test_active_user_cannot_initialize_another_purchase(self, initialize):
         LifetimeAccessEntitlement.grant_legacy_access(self.user)
@@ -363,6 +384,24 @@ class PaystackPhaseTwoTests(APITestCase):
         mismatch_response = self.client.post(f'/api/billing/purchases/{mismatch.reference}/verify/', {}, format='json')
         self.assertEqual(mismatch_response.status_code, 400)
         self.assertFalse(LifetimeAccessEntitlement.objects.filter(user=self.user).exists())
+
+    @patch('billing.services.payments.verify_transaction')
+    def test_verification_cannot_downgrade_a_confirmed_purchase(self, verify):
+        attempt = self.attempt(status=PaystackPurchaseAttempt.SUCCESSFUL)
+        entitlement = LifetimeAccessEntitlement.objects.create(
+            user=self.user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=attempt,
+        )
+        verify.return_value = self.provider_data(attempt, status='failed')
+
+        response = self.client.post(f'/api/billing/purchases/{attempt.reference}/verify/', {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        attempt.refresh_from_db()
+        entitlement.refresh_from_db()
+        self.assertEqual(attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertEqual(entitlement.status, LifetimeAccessEntitlement.ACTIVE)
 
     def test_purchase_detail_is_owner_only_and_access_reports_pending(self):
         attempt = self.attempt()
@@ -438,8 +477,32 @@ class PaystackPhaseTwoTests(APITestCase):
         self.assertEqual(chargeback_entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
 
 
-@override_settings(DEBUG=True, PAYSTACK_MODE='test', PAYSTACK_SECRET_KEY='sk_test_example', PAYSTACK_CALLBACK_URL='http://localhost:8000/api/billing/paystack/callback/')
+@override_settings(DEBUG=True, PAYSTACK_MODE='test', PAYSTACK_SECRET_KEY='sk_test_example', PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_test_secret', PAYSTACK_CALLBACK_URL='http://localhost:8000/api/billing/paystack/callback/')
 class PaystackServiceTests(TestCase):
+    @override_settings(
+        DEBUG=False,
+        PAYSTACK_MODE='live',
+        PAYSTACK_SECRET_KEY='sk_live_example',
+        PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_live_secret',
+        PAYSTACK_CALLBACK_URL='https://api.example.test/api/billing/paystack/callback/',
+        FRONTEND_PAYMENT_RETURN_URL='https://app.example.test/payment/complete',
+    )
+    def test_live_configuration_requires_matching_key_signing_secret_and_https_callback(self):
+        self.assertEqual(get_config().secret_key, 'sk_live_example')
+
+        with self.settings(PAYSTACK_SECRET_KEY='sk_test_wrong'):
+            with self.assertRaises(PaystackConfigurationError):
+                get_config()
+        with self.settings(PAYSTACK_SECRET_KEY='sk_live_example', PAYSTACK_WEBHOOK_SIGNING_SECRET=''):
+            with self.assertRaises(PaystackConfigurationError):
+                get_config()
+        with self.settings(PAYSTACK_SECRET_KEY='sk_live_example', PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_live_secret', PAYSTACK_CALLBACK_URL='http://api.example.test/callback/'):
+            with self.assertRaises(PaystackConfigurationError):
+                get_config()
+        with self.settings(PAYSTACK_SECRET_KEY='sk_live_example', PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_live_secret', PAYSTACK_CALLBACK_URL='https://api.example.test/callback/', FRONTEND_PAYMENT_RETURN_URL='http://app.example.test/payment/complete'):
+            with self.assertRaises(PaystackConfigurationError):
+                get_config()
+
     @patch('billing.services.paystack.requests.request')
     def test_service_uses_timeout_and_handles_provider_response(self, request):
         response = Mock(ok=True, status_code=200)

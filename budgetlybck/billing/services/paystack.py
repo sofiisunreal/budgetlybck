@@ -36,15 +36,23 @@ class PaystackConfig:
 
 
 def get_config():
-    if settings.PAYSTACK_MODE != 'test':
-        raise PaystackConfigurationError('Paystack is restricted to test mode.')
-    if not settings.PAYSTACK_SECRET_KEY or not settings.PAYSTACK_SECRET_KEY.startswith('sk_test_'):
-        raise PaystackConfigurationError('A Paystack test secret key is required.')
+    if settings.PAYSTACK_MODE not in {'test', 'live'}:
+        raise PaystackConfigurationError('Paystack mode is invalid.')
+    expected_key_prefix = f'sk_{settings.PAYSTACK_MODE}_'
+    if not settings.PAYSTACK_SECRET_KEY or not settings.PAYSTACK_SECRET_KEY.startswith(expected_key_prefix):
+        raise PaystackConfigurationError('A matching Paystack secret key is required.')
+    if not settings.PAYSTACK_WEBHOOK_SIGNING_SECRET:
+        raise PaystackConfigurationError('A Paystack webhook signing secret is required.')
     parsed = urlparse(settings.PAYSTACK_CALLBACK_URL)
     if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
         raise PaystackConfigurationError('A valid Paystack callback URL is required.')
-    if not settings.DEBUG and parsed.scheme != 'https':
-        raise PaystackConfigurationError('The Paystack callback URL must use HTTPS outside development.')
+    if settings.PAYSTACK_MODE == 'live' and parsed.scheme != 'https':
+        raise PaystackConfigurationError('The Paystack callback URL must use HTTPS in live mode.')
+    return_url = urlparse(settings.FRONTEND_PAYMENT_RETURN_URL)
+    if return_url.scheme not in {'http', 'https'} or not return_url.netloc:
+        raise PaystackConfigurationError('A valid frontend payment return URL is required.')
+    if settings.PAYSTACK_MODE == 'live' and return_url.scheme != 'https':
+        raise PaystackConfigurationError('The frontend payment return URL must use HTTPS in live mode.')
     return PaystackConfig(secret_key=settings.PAYSTACK_SECRET_KEY, callback_url=settings.PAYSTACK_CALLBACK_URL)
 
 

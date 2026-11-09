@@ -41,6 +41,8 @@ def apply_verification(reference, provider_data):
         mapped_status = provider_status_to_attempt_status(provider_status)
         if attempt.status == PaystackPurchaseAttempt.REVERSED and mapped_status == PaystackPurchaseAttempt.SUCCESSFUL:
             raise PurchaseVerificationError('A reversed purchase cannot be reactivated automatically.')
+        if attempt.status == PaystackPurchaseAttempt.SUCCESSFUL and mapped_status != PaystackPurchaseAttempt.SUCCESSFUL:
+            raise PurchaseVerificationError('A successful purchase cannot be downgraded by verification.')
         attempt.status, attempt.provider_transaction_id = mapped_status, provider_id
         attempt.provider_metadata, attempt.verified_at = _safe_metadata(provider_data), timezone.now()
         attempt.save(update_fields=['status', 'provider_transaction_id', 'provider_metadata', 'verified_at', 'updated_at'])

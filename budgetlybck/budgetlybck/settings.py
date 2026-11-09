@@ -222,7 +222,8 @@ BILLING_LIFETIME_OFFER_NAME = os.getenv('BILLING_LIFETIME_OFFER_NAME', 'Budgetly
 # true only after founding-user grants and end-to-end payment testing finish.
 BILLING_ENFORCE_LIFETIME_ACCESS = env_bool('BILLING_ENFORCE_LIFETIME_ACCESS', False)
 
-# Paystack remains test-only until a separately approved production rollout.
+# Set PAYSTACK_MODE=live only after the live secret, signing secret, HTTPS
+# callback and Paystack dashboard webhook have been configured together.
 PAYSTACK_MODE = os.getenv('PAYSTACK_MODE', 'test')
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
 PAYSTACK_WEBHOOK_SIGNING_SECRET = os.getenv('PAYSTACK_WEBHOOK_SIGNING_SECRET', '')
