@@ -143,6 +143,20 @@ def payment_return_url(reference, outcome):
     return f'{settings.FRONTEND_PAYMENT_RETURN_URL}{separator}{urlencode({"reference": reference, "status": outcome})}'
 
 
+def event_transaction_reference(data):
+    """Paystack refund and dispute payloads use transaction_reference."""
+    transaction = data.get('transaction')
+    candidates = (
+        data.get('reference'),
+        data.get('transaction_reference'),
+        transaction.get('reference') if isinstance(transaction, dict) else None,
+    )
+    for value in candidates:
+        if isinstance(value, str) and value:
+            return value
+    return ''
+
+
 class PaystackCallbackView(APIView):
     permission_classes = [AllowAny]
 
@@ -176,7 +190,7 @@ class PaystackWebhookView(APIView):
         except (UnicodeDecodeError, ValueError, TypeError, KeyError):
             return Response({'detail': 'Invalid webhook payload.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        reference, provider_id = str(data.get('reference') or ''), str(data.get('id') or '')
+        reference, provider_id = event_transaction_reference(data), str(data.get('id') or '')
         key_component = provider_id or reference or payload_digest(raw_body)
         deduplication_key = f'{event_type}:{key_component}'
         try:
@@ -194,8 +208,9 @@ class PaystackWebhookView(APIView):
                     raise PurchaseVerificationError('Webhook did not include a reference.')
                 verify_and_activate_purchase(reference)
             elif event_type in {'refund.processed', 'charge.dispute.create', 'charge.dispute.remind', 'charge.dispute.resolve'}:
-                if reference:
-                    apply_reversal(reference, event_type)
+                if not reference:
+                    raise PurchaseVerificationError('Webhook did not include a transaction reference.')
+                apply_reversal(reference, event_type, data)
             else:
                 webhook_event.processing_status, webhook_event.processed_at = PaystackWebhookEvent.IGNORED, timezone.now()
                 webhook_event.save(update_fields=['processing_status', 'processed_at'])

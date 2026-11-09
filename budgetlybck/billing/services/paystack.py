@@ -56,7 +56,7 @@ def get_config():
     return PaystackConfig(secret_key=settings.PAYSTACK_SECRET_KEY, callback_url=settings.PAYSTACK_CALLBACK_URL)
 
 
-def _request(method, path, *, payload=None):
+def _request(method, path, *, payload=None, expected_data_type=dict):
     config = get_config()
     try:
         response = requests.request(
@@ -71,12 +71,15 @@ def _request(method, path, *, payload=None):
     except requests.RequestException as error:
         logger.warning('Paystack request failed', extra={'operation': path, 'category': type(error).__name__})
         raise PaystackUnavailableError('Paystack is temporarily unavailable.') from error
+    if response.status_code >= 500 or response.status_code == 429:
+        logger.warning('Paystack service unavailable', extra={'operation': path, 'status_code': response.status_code})
+        raise PaystackUnavailableError('Paystack is temporarily unavailable.')
     try:
         body = response.json()
     except ValueError as error:
         logger.warning('Paystack returned malformed JSON', extra={'operation': path, 'status_code': response.status_code})
         raise PaystackResponseError('Paystack returned an invalid response.') from error
-    if not response.ok or body.get('status') is not True or not isinstance(body.get('data'), dict):
+    if not response.ok or body.get('status') is not True or not isinstance(body.get('data'), expected_data_type):
         logger.warning('Paystack rejected request', extra={'operation': path, 'status_code': response.status_code})
         raise PaystackResponseError('Paystack could not process the request.')
     return body['data']
@@ -96,6 +99,18 @@ def verify_transaction(reference):
     data = _request('GET', f'/transaction/verify/{reference}')
     if not isinstance(data.get('reference'), str) or not isinstance(data.get('status'), str):
         raise PaystackResponseError('Paystack returned an invalid verification response.')
+    return data
+
+
+def fetch_transaction_disputes(provider_transaction_id):
+    """Return Paystack disputes for one verified provider transaction ID."""
+    if not provider_transaction_id:
+        raise PaystackResponseError('A provider transaction identifier is required.')
+    data = _request(
+        'GET',
+        f'/dispute/transaction/{provider_transaction_id}',
+        expected_data_type=list,
+    )
     return data
 
 

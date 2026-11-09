@@ -200,6 +200,99 @@ class LifetimeAccessEntitlement(models.Model):
         return f'{self.user} - {self.status}'
 
 
+class EntitlementRestorationDecision(models.Model):
+    """Immutable approval and one-time execution record for dispute restoration."""
+
+    APPROVED = 'approved'
+    EXECUTED = 'executed'
+    STATES = [(APPROVED, 'Approved'), (EXECUTED, 'Executed')]
+
+    decision_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    purchase = models.OneToOneField(
+        PaystackPurchaseAttempt,
+        on_delete=models.PROTECT,
+        related_name='restoration_decision',
+    )
+    purchase_reference = models.CharField(max_length=80, editable=False)
+    entitlement = models.ForeignKey(
+        LifetimeAccessEntitlement,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='restoration_decisions',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='entitlement_restoration_decisions',
+    )
+    provider_transaction_id = models.CharField(max_length=80, editable=False)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='approved_entitlement_restorations',
+    )
+    approved_by_identifier = models.CharField(max_length=180, editable=False)
+    evidence_reference = models.CharField(max_length=255)
+    reason = models.TextField()
+    previous_status = models.CharField(max_length=24, editable=False)
+    new_status = models.CharField(max_length=24, null=True, blank=True, editable=False)
+    state = models.CharField(max_length=16, choices=STATES, default=APPROVED, editable=False)
+    approved_at = models.DateTimeField(auto_now_add=True)
+    executed_at = models.DateTimeField(null=True, blank=True, editable=False)
+    executed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='executed_entitlement_restorations',
+    )
+    executed_by_identifier = models.CharField(max_length=180, blank=True, editable=False)
+
+    class Meta:
+        ordering = ['-approved_at']
+        permissions = [
+            ('approve_dispute_restoration', 'Can approve disputed lifetime-access restoration'),
+            ('restore_disputed_access', 'Can execute disputed lifetime-access restoration'),
+        ]
+
+    def clean(self):
+        if self.purchase_id and self.purchase_reference != self.purchase.reference:
+            raise ValidationError('Decision purchase reference must match the purchase.')
+        if self.purchase_id and self.provider_transaction_id != (self.purchase.provider_transaction_id or ''):
+            raise ValidationError('Decision provider transaction ID must match the purchase.')
+        if self.entitlement_id and self.user_id and self.entitlement.user_id != self.user_id:
+            raise ValidationError('Decision user must match the entitlement user.')
+        if self.state == self.EXECUTED and (
+            self.executed_at is None or self.executed_by_id is None or self.new_status != LifetimeAccessEntitlement.ACTIVE
+        ):
+            raise ValidationError('Executed restoration decisions require executor, timestamp and active status.')
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = type(self).objects.get(pk=self.pk)
+            immutable_fields = (
+                'decision_id', 'purchase_id', 'purchase_reference', 'entitlement_id', 'user_id',
+                'provider_transaction_id', 'approved_by_id', 'approved_by_identifier',
+                'evidence_reference', 'reason', 'previous_status', 'approved_at',
+            )
+            if any(getattr(previous, field) != getattr(self, field) for field in immutable_fields):
+                raise ValidationError('Restoration decision audit facts cannot be changed.')
+            if previous.state == self.EXECUTED:
+                raise ValidationError('Executed restoration decisions cannot be changed.')
+            if self.state != self.EXECUTED:
+                raise ValidationError('Restoration decisions can only be executed once.')
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'Restoration decision {self.decision_id}'
+
+
 class PaystackWebhookEvent(models.Model):
     RECEIVED = 'received'
     PROCESSED = 'processed'

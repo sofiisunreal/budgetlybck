@@ -7,8 +7,9 @@ import time
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.core.exceptions import ValidationError
-from django.core.management import call_command
+from django.core.management import CommandError, call_command
 from django.db import IntegrityError
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -17,11 +18,15 @@ from rest_framework.test import APITestCase, APIRequestFactory, force_authentica
 
 from budget.models import Account, Category, Transaction
 from .models import (LifetimeAccessEntitlement, LifetimeAccessOffer,
-                     PaystackPurchaseAttempt, PaystackWebhookEvent)
+                     EntitlementRestorationDecision, PaystackPurchaseAttempt,
+                     PaystackWebhookEvent)
 from .permissions import has_lifetime_access
 from .services.paystack import (PaystackConfigurationError, PaystackUnavailableError,
                                 get_config, initialize_transaction,
                                 webhook_signature_valid)
+from .services.dispute_restoration import (DisputeRestorationError,
+                                           approve_restoration,
+                                           execute_restoration)
 from .views import PaystackWebhookView, PurchaseInitializeView
 
 
@@ -266,6 +271,197 @@ class BillingManagementCommandTests(TestCase):
         self.assertEqual(entitlement.activating_purchase_id, purchase.id)
 
 
+class DisputeRestorationTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user('disputed-user', 'disputed@example.com', 'SafePassword123!')
+        self.approver = User.objects.create_user('approver', 'approver@example.com', 'SafePassword123!', is_staff=True)
+        self.executor = User.objects.create_user('executor', 'executor@example.com', 'SafePassword123!', is_staff=True)
+        self.unauthorized = User.objects.create_user('unauthorized', 'unauthorized@example.com', 'SafePassword123!', is_staff=True)
+        self.approver.user_permissions.add(Permission.objects.get(codename='approve_dispute_restoration'))
+        self.executor.user_permissions.add(Permission.objects.get(codename='restore_disputed_access'))
+        self.offer = LifetimeAccessOffer.objects.create(name='Dispute offer', price_minor=105000, currency='KES')
+        self.attempt = PaystackPurchaseAttempt.objects.create(
+            user=self.user,
+            offer=self.offer,
+            expected_amount_minor=105000,
+            expected_currency='KES',
+            status=PaystackPurchaseAttempt.SUCCESSFUL,
+            provider_transaction_id='445566',
+            provider_metadata={'dispute_review_required': True},
+        )
+        self.entitlement = LifetimeAccessEntitlement.objects.create(
+            user=self.user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=self.attempt,
+            status=LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED,
+        )
+
+    def provider_data(self):
+        return {
+            'id': 445566,
+            'reference': self.attempt.reference,
+            'status': 'success',
+            'amount': 105000,
+            'currency': 'KES',
+        }
+
+    def resolved_disputes(self, **overrides):
+        dispute = {
+            'status': 'resolved',
+            'resolution': 'declined',
+            'refund_amount': None,
+            'transaction': {'id': 445566, 'reference': self.attempt.reference},
+        }
+        dispute.update(overrides)
+        return [dispute]
+
+    def approve(self, **overrides):
+        values = {
+            'purchase_reference': self.attempt.reference,
+            'operator': self.approver,
+            'evidence_reference': 'CASE-1001',
+            'reason': 'Paystack dispute record shows a declined resolution.',
+            'provider_data': self.provider_data(),
+        }
+        values.update(overrides)
+        return approve_restoration(**values)
+
+    def test_approved_decision_restores_once_after_authoritative_provider_outcome(self):
+        decision = self.approve()
+
+        executed = execute_restoration(
+            decision_id=decision.decision_id,
+            operator=self.executor,
+            provider_data=self.provider_data(),
+            disputes=self.resolved_disputes(),
+        )
+
+        self.entitlement.refresh_from_db()
+        self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.ACTIVE)
+        self.assertEqual(executed.state, EntitlementRestorationDecision.EXECUTED)
+        self.assertEqual(executed.executed_by_id, self.executor.id)
+        with self.assertRaises(DisputeRestorationError):
+            execute_restoration(
+                decision_id=decision.decision_id,
+                operator=self.executor,
+                provider_data=self.provider_data(),
+                disputes=self.resolved_disputes(),
+            )
+
+    def test_invalid_evidence_and_unauthorized_operators_cannot_approve_or_execute(self):
+        with self.assertRaises(DisputeRestorationError):
+            self.approve(evidence_reference='')
+        with self.assertRaises(DisputeRestorationError):
+            self.approve(operator=self.unauthorized)
+        decision = self.approve()
+        with self.assertRaises(DisputeRestorationError):
+            execute_restoration(
+                decision_id=decision.decision_id,
+                operator=self.unauthorized,
+                provider_data=self.provider_data(),
+                disputes=self.resolved_disputes(),
+            )
+        self.assertEqual(EntitlementRestorationDecision.objects.count(), 1)
+        self.entitlement.refresh_from_db()
+        self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
+
+    def test_unresolved_or_refunded_disputes_cannot_restore_access(self):
+        decision = self.approve()
+        with self.assertRaises(DisputeRestorationError):
+            execute_restoration(
+                decision_id=decision.decision_id,
+                operator=self.executor,
+                provider_data=self.provider_data(),
+                disputes=self.resolved_disputes(status='pending'),
+            )
+        self.attempt.provider_metadata['refunds'] = [{'amount': 105000}]
+        self.attempt.save(update_fields=['provider_metadata'])
+        with self.assertRaises(DisputeRestorationError):
+            execute_restoration(
+                decision_id=decision.decision_id,
+                operator=self.executor,
+                provider_data=self.provider_data(),
+                disputes=self.resolved_disputes(),
+            )
+        self.entitlement.refresh_from_db()
+        self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
+
+    def test_decision_is_unique_immutable_and_rolls_back_if_execution_record_cannot_save(self):
+        decision = self.approve()
+        with self.assertRaises(DisputeRestorationError):
+            self.approve()
+        decision.reason = 'changed'
+        with self.assertRaises(ValidationError):
+            decision.save()
+        decision.refresh_from_db()
+        with patch.object(EntitlementRestorationDecision, 'save', side_effect=ValidationError('audit write failed')):
+            with self.assertRaises(ValidationError):
+                execute_restoration(
+                    decision_id=decision.decision_id,
+                    operator=self.executor,
+                    provider_data=self.provider_data(),
+                    disputes=self.resolved_disputes(),
+                )
+        self.entitlement.refresh_from_db()
+        decision.refresh_from_db()
+        self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
+        self.assertEqual(decision.state, EntitlementRestorationDecision.APPROVED)
+
+    def test_deleted_account_prevents_execution(self):
+        decision = self.approve()
+        self.user.delete()
+        with self.assertRaises(DisputeRestorationError):
+            execute_restoration(
+                decision_id=decision.decision_id,
+                operator=self.executor,
+                provider_data=self.provider_data(),
+                disputes=self.resolved_disputes(),
+            )
+
+    @patch('billing.management.commands.approve_dispute_restoration.verify_transaction')
+    @patch('billing.management.commands.restore_disputed_access.verify_transaction')
+    @patch('billing.management.commands.restore_disputed_access.fetch_transaction_disputes')
+    @patch('billing.management.commands.restore_disputed_access.getpass.getpass', return_value='SafePassword123!')
+    @patch('billing.management.commands.approve_dispute_restoration.getpass.getpass', return_value='SafePassword123!')
+    def test_two_person_management_commands_require_confirm_and_execute_once(self, approve_password, restore_password, fetch_disputes, restore_verify, approve_verify):
+        approve_verify.return_value = self.provider_data()
+        restore_verify.return_value = self.provider_data()
+        fetch_disputes.return_value = self.resolved_disputes()
+
+        with self.assertRaises(CommandError):
+            call_command(
+                'approve_dispute_restoration',
+                '--purchase-reference', self.attempt.reference,
+                '--operator-email', self.approver.email,
+                '--evidence-reference', 'CASE-1002',
+                '--reason', 'Approved after provider review.',
+            )
+        call_command(
+            'approve_dispute_restoration',
+            '--purchase-reference', self.attempt.reference,
+            '--operator-email', self.approver.email,
+            '--evidence-reference', 'CASE-1002',
+            '--reason', 'Approved after provider review.',
+            '--confirm',
+        )
+        decision = EntitlementRestorationDecision.objects.get()
+        with self.assertRaises(CommandError):
+            call_command(
+                'restore_disputed_access',
+                '--decision-id', str(decision.decision_id),
+                '--operator-email', self.approver.email,
+                '--confirm',
+            )
+        call_command(
+            'restore_disputed_access',
+            '--decision-id', str(decision.decision_id),
+            '--operator-email', self.executor.email,
+            '--confirm',
+        )
+        decision.refresh_from_db()
+        self.assertEqual(decision.state, EntitlementRestorationDecision.EXECUTED)
+
+
 @override_settings(
     DEBUG=True,
     DEBUG_PROPAGATE_EXCEPTIONS=True,
@@ -403,6 +599,28 @@ class PaystackPhaseTwoTests(APITestCase):
         self.assertEqual(attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
         self.assertEqual(entitlement.status, LifetimeAccessEntitlement.ACTIVE)
 
+    @patch('billing.services.payments.verify_transaction')
+    def test_verification_requires_a_stable_provider_transaction_id(self, verify):
+        attempt = self.attempt()
+        verify.return_value = self.provider_data(attempt, id=None)
+
+        missing_id = self.client.post(f'/api/billing/purchases/{attempt.reference}/verify/', {}, format='json')
+
+        self.assertEqual(missing_id.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(LifetimeAccessEntitlement.objects.filter(user=self.user).exists())
+
+        verify.return_value = self.provider_data(attempt, id=987654)
+        self.assertEqual(
+            self.client.post(f'/api/billing/purchases/{attempt.reference}/verify/', {}, format='json').status_code,
+            status.HTTP_200_OK,
+        )
+        verify.return_value = self.provider_data(attempt, id=987655)
+        changed_id = self.client.post(f'/api/billing/purchases/{attempt.reference}/verify/', {}, format='json')
+
+        self.assertEqual(changed_id.status_code, status.HTTP_400_BAD_REQUEST)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.provider_transaction_id, '987654')
+
     def test_purchase_detail_is_owner_only_and_access_reports_pending(self):
         attempt = self.attempt()
         access = self.client.get('/api/billing/access/')
@@ -452,17 +670,57 @@ class PaystackPhaseTwoTests(APITestCase):
         self.assertEqual((invalid.status_code, replay.status_code), (401, 401))
         self.assertFalse(PaystackWebhookEvent.objects.exists())
 
+    def test_webhook_rejects_missing_signature_and_malformed_signed_payload(self):
+        missing = self.client.post(
+            '/api/billing/paystack/webhook/', b'{}', content_type='application/json'
+        )
+        raw = b'not-json'
+        timestamp = int(time.time())
+        digest = hmac.new(
+            b'whsec_test_secret', f'{timestamp}.'.encode('ascii') + raw, hashlib.sha512
+        ).hexdigest()
+        malformed = self.client.post(
+            '/api/billing/paystack/webhook/', raw, content_type='application/json',
+            HTTP_PAYSTACK_SIGNATURE=f't={timestamp},v1=whk_test:{digest}',
+        )
+
+        self.assertEqual((missing.status_code, malformed.status_code), (401, 400))
+        self.assertFalse(PaystackWebhookEvent.objects.exists())
+
+    def test_signed_refund_without_transaction_reference_is_not_processed(self):
+        event = {'event': 'refund.processed', 'data': {'id': 96, 'amount': '105000', 'currency': 'KES'}}
+        raw, signature = self.signed_webhook(event)
+
+        response = self.client.post('/api/billing/paystack/webhook/', raw, content_type='application/json', HTTP_PAYSTACK_SIGNATURE=signature)
+
+        self.assertEqual(response.status_code, 200)
+        webhook_event = PaystackWebhookEvent.objects.get()
+        self.assertEqual(webhook_event.processing_status, PaystackWebhookEvent.FAILED)
+        self.assertEqual(webhook_event.error_category, 'verification_failed')
+
     def test_refund_and_chargeback_events_move_paid_access_to_review_states(self):
         attempt = self.attempt(status=PaystackPurchaseAttempt.SUCCESSFUL)
         entitlement = LifetimeAccessEntitlement.objects.create(
             user=self.user, source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE, activating_purchase=attempt
         )
-        refund = {'event': 'refund.processed', 'data': {'id': 90, 'reference': attempt.reference}}
+        refund = {
+            'event': 'refund.processed',
+            'data': {
+                'id': 90,
+                'transaction_reference': attempt.reference,
+                'amount': '105000',
+                'currency': 'KES',
+            },
+        }
         raw, signature = self.signed_webhook(refund)
         response = self.client.post('/api/billing/paystack/webhook/', raw, content_type='application/json', HTTP_PAYSTACK_SIGNATURE=signature)
         entitlement.refresh_from_db()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(entitlement.status, LifetimeAccessEntitlement.REFUNDED)
+
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, PaystackPurchaseAttempt.REVERSED)
+        self.assertFalse(attempt.provider_metadata.get('refund_review_required', False))
 
         chargeback_attempt = self.attempt(user=self.other_user, status=PaystackPurchaseAttempt.SUCCESSFUL)
         chargeback_entitlement = LifetimeAccessEntitlement.objects.create(
@@ -475,6 +733,109 @@ class PaystackPhaseTwoTests(APITestCase):
         chargeback_entitlement.refresh_from_db()
         self.assertEqual(dispute_response.status_code, 200)
         self.assertEqual(chargeback_entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
+
+    def test_partial_refund_is_retained_without_revoking_lifetime_access(self):
+        attempt = self.attempt(status=PaystackPurchaseAttempt.SUCCESSFUL)
+        entitlement = LifetimeAccessEntitlement.objects.create(
+            user=self.user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=attempt,
+        )
+        refund = {
+            'event': 'refund.processed',
+            'data': {
+                'id': 92,
+                'transaction_reference': attempt.reference,
+                'amount': '50000',
+                'currency': 'KES',
+            },
+        }
+        raw, signature = self.signed_webhook(refund)
+
+        response = self.client.post('/api/billing/paystack/webhook/', raw, content_type='application/json', HTTP_PAYSTACK_SIGNATURE=signature)
+
+        self.assertEqual(response.status_code, 200)
+        attempt.refresh_from_db()
+        entitlement.refresh_from_db()
+        self.assertEqual(attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertEqual(entitlement.status, LifetimeAccessEntitlement.ACTIVE)
+        self.assertEqual(attempt.provider_metadata['refunds'][0]['amount'], 50000)
+        self.assertTrue(attempt.provider_metadata['refund_review_required'])
+
+    def test_mismatched_refund_currency_is_retained_for_reconciliation_without_access_change(self):
+        attempt = self.attempt(status=PaystackPurchaseAttempt.SUCCESSFUL)
+        entitlement = LifetimeAccessEntitlement.objects.create(
+            user=self.user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=attempt,
+        )
+        refund = {
+            'event': 'refund.processed',
+            'data': {
+                'id': 95,
+                'transaction_reference': attempt.reference,
+                'amount': '105000',
+                'currency': 'USD',
+            },
+        }
+        raw, signature = self.signed_webhook(refund)
+
+        response = self.client.post('/api/billing/paystack/webhook/', raw, content_type='application/json', HTTP_PAYSTACK_SIGNATURE=signature)
+
+        self.assertEqual(response.status_code, 200)
+        attempt.refresh_from_db()
+        entitlement.refresh_from_db()
+        event = PaystackWebhookEvent.objects.get(transaction_reference=attempt.reference)
+        self.assertEqual(event.processing_status, PaystackWebhookEvent.FAILED)
+        self.assertEqual(attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertEqual(entitlement.status, LifetimeAccessEntitlement.ACTIVE)
+
+    def test_dispute_resolution_does_not_automatically_restore_access(self):
+        attempt = self.attempt(status=PaystackPurchaseAttempt.SUCCESSFUL)
+        entitlement = LifetimeAccessEntitlement.objects.create(
+            user=self.user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=attempt,
+            status=LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED,
+        )
+        dispute = {
+            'event': 'charge.dispute.resolve',
+            'data': {'id': 93, 'transaction_reference': attempt.reference},
+        }
+        raw, signature = self.signed_webhook(dispute)
+
+        response = self.client.post('/api/billing/paystack/webhook/', raw, content_type='application/json', HTTP_PAYSTACK_SIGNATURE=signature)
+
+        self.assertEqual(response.status_code, 200)
+        attempt.refresh_from_db()
+        entitlement.refresh_from_db()
+        self.assertEqual(attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertEqual(entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
+        self.assertTrue(attempt.provider_metadata['dispute_review_required'])
+
+    @patch('billing.services.payments.verify_transaction')
+    def test_dispute_before_delayed_success_creates_suspended_entitlement(self, verify):
+        attempt = self.attempt(status=PaystackPurchaseAttempt.PENDING)
+        dispute = {
+            'event': 'charge.dispute.create',
+            'data': {'id': 94, 'transaction_reference': attempt.reference},
+        }
+        raw, signature = self.signed_webhook(dispute)
+        dispute_response = self.client.post(
+            '/api/billing/paystack/webhook/', raw,
+            content_type='application/json', HTTP_PAYSTACK_SIGNATURE=signature,
+        )
+        verify.return_value = self.provider_data(attempt)
+
+        verification_response = self.client.post(
+            f'/api/billing/purchases/{attempt.reference}/verify/', {}, format='json'
+        )
+
+        self.assertEqual(dispute_response.status_code, 200)
+        self.assertEqual(verification_response.status_code, 200)
+        entitlement = LifetimeAccessEntitlement.objects.get(user=self.user)
+        self.assertEqual(entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
+        self.assertFalse(verification_response.data['has_lifetime_access'])
 
 
 @override_settings(DEBUG=True, PAYSTACK_MODE='test', PAYSTACK_SECRET_KEY='sk_test_example', PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_test_secret', PAYSTACK_CALLBACK_URL='http://localhost:8000/api/billing/paystack/callback/')
@@ -518,6 +879,17 @@ class PaystackServiceTests(TestCase):
     @patch('billing.services.paystack.requests.request')
     def test_service_turns_provider_timeout_into_safe_error(self, request):
         request.side_effect = __import__('requests').Timeout()
+        with self.assertRaises(PaystackUnavailableError):
+            initialize_transaction(
+                email='payer@example.com', amount_minor=105000, reference='bgt_reference',
+                callback_url='http://localhost:8000/api/billing/paystack/callback/', metadata={},
+            )
+
+    @patch('billing.services.paystack.requests.request')
+    def test_service_turns_provider_5xx_into_safe_unavailable_error(self, request):
+        response = Mock(ok=False, status_code=502)
+        request.return_value = response
+
         with self.assertRaises(PaystackUnavailableError):
             initialize_transaction(
                 email='payer@example.com', amount_minor=105000, reference='bgt_reference',

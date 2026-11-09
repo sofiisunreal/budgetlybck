@@ -1,7 +1,8 @@
 from django.contrib import admin
 
 from .models import (LifetimeAccessEntitlement, LifetimeAccessOffer,
-                     PaystackPurchaseAttempt, PaystackWebhookEvent)
+                     EntitlementRestorationDecision, PaystackPurchaseAttempt,
+                     PaystackWebhookEvent)
 
 
 @admin.register(LifetimeAccessOffer)
@@ -51,6 +52,20 @@ class PaystackWebhookEventAdmin(admin.ModelAdmin):
     list_filter = ('event_type', 'processing_status')
     search_fields = ('transaction_reference', 'deduplication_key', 'payload_digest')
     readonly_fields = [field.name for field in PaystackWebhookEvent._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(EntitlementRestorationDecision)
+class EntitlementRestorationDecisionAdmin(admin.ModelAdmin):
+    list_display = ('decision_id', 'purchase_reference', 'state', 'previous_status', 'new_status', 'approved_at', 'executed_at')
+    list_filter = ('state', 'previous_status', 'new_status')
+    search_fields = ('decision_id', 'purchase_reference', 'provider_transaction_id', 'approved_by_identifier')
+    readonly_fields = [field.name for field in EntitlementRestorationDecision._meta.fields]
 
     def has_add_permission(self, request):
         return False
