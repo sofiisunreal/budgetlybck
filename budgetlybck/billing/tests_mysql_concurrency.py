@@ -160,7 +160,7 @@ class MySQLPaystackConcurrencyTests(TransactionTestCase):
         self.assertEqual(LifetimeAccessEntitlement.objects.filter(user=self.user).count(), 1)
         self.assertEqual(PaystackWebhookEvent.objects.count(), 1)
 
-    def test_parallel_restoration_executes_an_approved_decision_once(self):
+    def test_parallel_restoration_refuses_ambiguous_provider_outcome(self):
         self.attempt = self.create_attempt()
         self.attempt.status = PaystackPurchaseAttempt.SUCCESSFUL
         self.attempt.provider_transaction_id = '998877'
@@ -209,8 +209,8 @@ class MySQLPaystackConcurrencyTests(TransactionTestCase):
 
         results = self.run_workers(lambda: execute(executor_one), lambda: execute(executor_two))
 
-        self.assertCountEqual(results, ['executed', 'rejected'])
+        self.assertCountEqual(results, ['rejected', 'rejected'])
         decision.refresh_from_db()
         entitlement.refresh_from_db()
-        self.assertEqual(decision.state, EntitlementRestorationDecision.EXECUTED)
-        self.assertEqual(entitlement.status, LifetimeAccessEntitlement.ACTIVE)
+        self.assertEqual(decision.state, EntitlementRestorationDecision.APPROVED)
+        self.assertEqual(entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)

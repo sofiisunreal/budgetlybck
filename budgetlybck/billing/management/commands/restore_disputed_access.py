@@ -12,7 +12,10 @@ from billing.models import EntitlementRestorationDecision
 
 
 class Command(BaseCommand):
-    help = 'Execute one approved, provider-verified disputed-access restoration.'
+    help = (
+        'Attempt one approved, provider-verified disputed-access restoration. '
+        'It fails closed unless Paystack supplies a documented final merchant-favourable outcome.'
+    )
 
     def add_arguments(self, parser):
         parser.add_argument('--decision-id', required=True)

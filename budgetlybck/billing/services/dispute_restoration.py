@@ -1,7 +1,6 @@
 """Audited, provider-verified restoration of a suspended entitlement."""
 
 from django.contrib.auth import get_user_model
-from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
@@ -32,29 +31,23 @@ def refund_total(attempt):
 
 
 def dispute_outcome_allows_restoration(disputes, attempt):
-    """Accept only a resolved, merchant-declined, no-refund provider record."""
-    if not isinstance(disputes, list) or not disputes:
-        return False
-    for dispute in disputes:
-        if not isinstance(dispute, dict):
-            return False
-        transaction_data = dispute.get('transaction')
-        if not isinstance(transaction_data, dict):
-            return False
-        if str(transaction_data.get('id')) != attempt.provider_transaction_id:
-            return False
-        if transaction_data.get('reference') != attempt.reference:
-            return False
-        if dispute.get('status') != 'resolved':
-            return False
-        # Paystack documents ``declined`` as the merchant decision to reject
-        # the dispute. Any other or absent outcome needs manual review.
-        if dispute.get('resolution') != 'declined':
-            return False
-        refund_amount = dispute.get('refund_amount')
-        if refund_amount not in (None, 0, '0'):
-            return False
-    return True
+    """Return false until Paystack exposes an authoritative final outcome.
+
+    The available dispute payload records the merchant's ``resolution`` action.
+    In particular, ``resolution="declined"`` means that the merchant declined
+    the dispute; it is not evidence that Paystack, the issuer, or the card
+    network finally ruled for the merchant.  ``status="resolved"`` has the
+    same ambiguity.  Transaction verification can prove that the payment
+    exists, but cannot establish that a chargeback can no longer reverse it.
+
+    Consequently the automated path deliberately fails closed.  Keep the
+    parameter signature because execution still obtains and records the
+    provider facts before refusing the status transition.  A future provider
+    API field with a documented, final merchant-favourable outcome can be
+    handled here with a targeted review and regression tests.
+    """
+    del disputes, attempt
+    return False
 
 
 def approve_restoration(*, purchase_reference, operator, evidence_reference, reason, provider_data):
@@ -73,6 +66,8 @@ def approve_restoration(*, purchase_reference, operator, evidence_reference, rea
             raise DisputeRestorationError('Purchase ownership no longer matches the entitlement.')
         if entitlement.status != LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED:
             raise DisputeRestorationError('Only suspended entitlements can be approved for restoration.')
+        if attempt.status != PaystackPurchaseAttempt.SUCCESSFUL:
+            raise DisputeRestorationError('Only a currently verified successful purchase can be restored.')
         if not attempt.provider_transaction_id or attempt.status == PaystackPurchaseAttempt.REVERSED:
             raise DisputeRestorationError('The purchase is not eligible for restoration.')
         if refund_total(attempt) >= attempt.expected_amount_minor:
@@ -117,6 +112,8 @@ def execute_restoration(*, decision_id, operator, provider_data, disputes):
             raise DisputeRestorationError('Provider transaction facts no longer match the approved decision.')
         if entitlement.status != LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED:
             raise DisputeRestorationError('The entitlement is no longer suspended.')
+        if attempt.status != PaystackPurchaseAttempt.SUCCESSFUL:
+            raise DisputeRestorationError('Only a currently verified successful purchase can be restored.')
         if attempt.status == PaystackPurchaseAttempt.REVERSED or refund_total(attempt) >= attempt.expected_amount_minor:
             raise DisputeRestorationError('A full refund prevents restoration.')
         if not dispute_outcome_allows_restoration(disputes, attempt):

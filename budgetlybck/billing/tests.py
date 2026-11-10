@@ -27,6 +27,7 @@ from .services.paystack import (PaystackConfigurationError, PaystackUnavailableE
 from .services.dispute_restoration import (DisputeRestorationError,
                                            approve_restoration,
                                            execute_restoration)
+from .services.access import PurchaseVerificationError
 from .views import PaystackWebhookView, PurchaseInitializeView
 
 
@@ -296,14 +297,16 @@ class DisputeRestorationTests(TestCase):
             status=LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED,
         )
 
-    def provider_data(self):
-        return {
+    def provider_data(self, **overrides):
+        data = {
             'id': 445566,
             'reference': self.attempt.reference,
             'status': 'success',
             'amount': 105000,
             'currency': 'KES',
         }
+        data.update(overrides)
+        return data
 
     def resolved_disputes(self, **overrides):
         dispute = {
@@ -326,27 +329,22 @@ class DisputeRestorationTests(TestCase):
         values.update(overrides)
         return approve_restoration(**values)
 
-    def test_approved_decision_restores_once_after_authoritative_provider_outcome(self):
+    def test_resolved_declined_dispute_is_ambiguous_and_fails_closed(self):
         decision = self.approve()
 
-        executed = execute_restoration(
-            decision_id=decision.decision_id,
-            operator=self.executor,
-            provider_data=self.provider_data(),
-            disputes=self.resolved_disputes(),
-        )
-
-        self.entitlement.refresh_from_db()
-        self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.ACTIVE)
-        self.assertEqual(executed.state, EntitlementRestorationDecision.EXECUTED)
-        self.assertEqual(executed.executed_by_id, self.executor.id)
-        with self.assertRaises(DisputeRestorationError):
+        with self.assertRaisesRegex(DisputeRestorationError, 'cannot establish a favorable final dispute outcome'):
             execute_restoration(
                 decision_id=decision.decision_id,
                 operator=self.executor,
                 provider_data=self.provider_data(),
                 disputes=self.resolved_disputes(),
             )
+
+        self.entitlement.refresh_from_db()
+        decision.refresh_from_db()
+        self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
+        self.assertEqual(decision.state, EntitlementRestorationDecision.APPROVED)
+        self.assertIsNone(decision.executed_at)
 
     def test_invalid_evidence_and_unauthorized_operators_cannot_approve_or_execute(self):
         with self.assertRaises(DisputeRestorationError):
@@ -386,6 +384,14 @@ class DisputeRestorationTests(TestCase):
         self.entitlement.refresh_from_db()
         self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
 
+    def test_non_successful_payment_cannot_receive_a_restoration_approval(self):
+        with self.assertRaises(PurchaseVerificationError):
+            self.approve(provider_data=self.provider_data(status='pending'))
+
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertFalse(EntitlementRestorationDecision.objects.exists())
+
     def test_decision_is_unique_immutable_and_rolls_back_if_execution_record_cannot_save(self):
         decision = self.approve()
         with self.assertRaises(DisputeRestorationError):
@@ -394,14 +400,15 @@ class DisputeRestorationTests(TestCase):
         with self.assertRaises(ValidationError):
             decision.save()
         decision.refresh_from_db()
-        with patch.object(EntitlementRestorationDecision, 'save', side_effect=ValidationError('audit write failed')):
-            with self.assertRaises(ValidationError):
-                execute_restoration(
-                    decision_id=decision.decision_id,
-                    operator=self.executor,
-                    provider_data=self.provider_data(),
-                    disputes=self.resolved_disputes(),
-                )
+        with patch('billing.services.dispute_restoration.dispute_outcome_allows_restoration', return_value=True):
+            with patch.object(EntitlementRestorationDecision, 'save', side_effect=ValidationError('audit write failed')):
+                with self.assertRaises(ValidationError):
+                    execute_restoration(
+                        decision_id=decision.decision_id,
+                        operator=self.executor,
+                        provider_data=self.provider_data(),
+                        disputes=self.resolved_disputes(),
+                    )
         self.entitlement.refresh_from_db()
         decision.refresh_from_db()
         self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
@@ -423,7 +430,7 @@ class DisputeRestorationTests(TestCase):
     @patch('billing.management.commands.restore_disputed_access.fetch_transaction_disputes')
     @patch('billing.management.commands.restore_disputed_access.getpass.getpass', return_value='SafePassword123!')
     @patch('billing.management.commands.approve_dispute_restoration.getpass.getpass', return_value='SafePassword123!')
-    def test_two_person_management_commands_require_confirm_and_execute_once(self, approve_password, restore_password, fetch_disputes, restore_verify, approve_verify):
+    def test_two_person_management_commands_refuse_ambiguous_provider_outcome(self, approve_password, restore_password, fetch_disputes, restore_verify, approve_verify):
         approve_verify.return_value = self.provider_data()
         restore_verify.return_value = self.provider_data()
         fetch_disputes.return_value = self.resolved_disputes()
@@ -452,14 +459,17 @@ class DisputeRestorationTests(TestCase):
                 '--operator-email', self.approver.email,
                 '--confirm',
             )
-        call_command(
-            'restore_disputed_access',
-            '--decision-id', str(decision.decision_id),
-            '--operator-email', self.executor.email,
-            '--confirm',
-        )
+        with self.assertRaises(CommandError):
+            call_command(
+                'restore_disputed_access',
+                '--decision-id', str(decision.decision_id),
+                '--operator-email', self.executor.email,
+                '--confirm',
+            )
         decision.refresh_from_db()
-        self.assertEqual(decision.state, EntitlementRestorationDecision.EXECUTED)
+        self.entitlement.refresh_from_db()
+        self.assertEqual(decision.state, EntitlementRestorationDecision.APPROVED)
+        self.assertEqual(self.entitlement.status, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
 
 
 @override_settings(
