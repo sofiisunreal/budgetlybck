@@ -16,6 +16,8 @@ from pathlib import Path
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
+from .database_tls import database_tls_options
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 load_dotenv(BASE_DIR / ".env")
@@ -121,6 +123,18 @@ WSGI_APPLICATION = 'budgetlybck.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
+#
+# TLS stays opt-in to avoid changing a currently running deployment before its
+# trusted CA bundle has been staged. Once enabled it is strict and cannot fall
+# back to an unencrypted connection.
+DJANGO_DB_TLS_ENABLED = env_bool('DJANGO_DB_TLS_ENABLED', False)
+DJANGO_DB_TLS_CA_PATH = os.getenv('DJANGO_DB_TLS_CA_PATH', '')
+DATABASE_OPTIONS = database_tls_options(
+    enabled=DJANGO_DB_TLS_ENABLED,
+    engine=os.getenv('DJANGO_DB_ENGINE', 'django.db.backends.mysql'),
+    ca_path=DJANGO_DB_TLS_CA_PATH,
+    host=os.getenv('DJANGO_DB_HOST', ''),
+)
 
 DATABASES = {
     "default": {
@@ -130,6 +144,7 @@ DATABASES = {
         "PASSWORD": os.getenv("DJANGO_DB_PASSWORD"),
         "HOST": os.getenv("DJANGO_DB_HOST"),
         "PORT": os.getenv("DJANGO_DB_PORT", "3306"),
+        "OPTIONS": DATABASE_OPTIONS,
     }
 }
 
