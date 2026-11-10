@@ -35,14 +35,37 @@ class PaystackConfig:
     callback_url: str
 
 
-def get_config():
+def _active_credentials():
     if settings.PAYSTACK_MODE not in {'test', 'live'}:
         raise PaystackConfigurationError('Paystack mode is invalid.')
+
+    if settings.PAYSTACK_MODE == 'test':
+        # Preserve development compatibility while deployments adopt the
+        # explicit variables.  Live mode must never use these generic values.
+        secret_key = settings.PAYSTACK_TEST_SECRET_KEY or settings.PAYSTACK_SECRET_KEY
+        signing_secret = (
+            settings.PAYSTACK_TEST_WEBHOOK_SIGNING_SECRET
+            or settings.PAYSTACK_WEBHOOK_SIGNING_SECRET
+        )
+        previous_signing_secret = (
+            settings.PAYSTACK_TEST_WEBHOOK_PREVIOUS_SIGNING_SECRET
+            or settings.PAYSTACK_WEBHOOK_PREVIOUS_SIGNING_SECRET
+        )
+    else:
+        secret_key = settings.PAYSTACK_LIVE_SECRET_KEY
+        signing_secret = settings.PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET
+        previous_signing_secret = settings.PAYSTACK_LIVE_WEBHOOK_PREVIOUS_SIGNING_SECRET
+
     expected_key_prefix = f'sk_{settings.PAYSTACK_MODE}_'
-    if not settings.PAYSTACK_SECRET_KEY or not settings.PAYSTACK_SECRET_KEY.startswith(expected_key_prefix):
+    if not secret_key or not secret_key.startswith(expected_key_prefix):
         raise PaystackConfigurationError('A matching Paystack secret key is required.')
-    if not settings.PAYSTACK_WEBHOOK_SIGNING_SECRET:
+    if not signing_secret:
         raise PaystackConfigurationError('A Paystack webhook signing secret is required.')
+    return secret_key, signing_secret, previous_signing_secret
+
+
+def get_config():
+    secret_key, _, _ = _active_credentials()
     parsed = urlparse(settings.PAYSTACK_CALLBACK_URL)
     if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
         raise PaystackConfigurationError('A valid Paystack callback URL is required.')
@@ -53,7 +76,7 @@ def get_config():
         raise PaystackConfigurationError('A valid frontend payment return URL is required.')
     if settings.PAYSTACK_MODE == 'live' and return_url.scheme != 'https':
         raise PaystackConfigurationError('The frontend payment return URL must use HTTPS in live mode.')
-    return PaystackConfig(secret_key=settings.PAYSTACK_SECRET_KEY, callback_url=settings.PAYSTACK_CALLBACK_URL)
+    return PaystackConfig(secret_key=secret_key, callback_url=settings.PAYSTACK_CALLBACK_URL)
 
 
 def _request(method, path, *, payload=None, expected_data_type=dict):
@@ -119,7 +142,11 @@ def payload_digest(raw_body):
 
 
 def _timestamped_signature_valid(raw_body, header):
-    secrets = [value for value in (settings.PAYSTACK_WEBHOOK_SIGNING_SECRET, settings.PAYSTACK_WEBHOOK_PREVIOUS_SIGNING_SECRET) if value]
+    try:
+        _, signing_secret, previous_signing_secret = _active_credentials()
+    except PaystackConfigurationError:
+        return False
+    secrets = [value for value in (signing_secret, previous_signing_secret) if value]
     if not secrets:
         return False
     timestamp_value, signatures = None, []
@@ -153,7 +180,11 @@ def webhook_signature_valid(raw_body, headers):
     if not settings.PAYSTACK_ALLOW_LEGACY_WEBHOOK_SIGNATURE:
         return False
     legacy = headers.get('x-paystack-signature', '')
-    if not legacy or not settings.PAYSTACK_SECRET_KEY:
+    try:
+        secret_key, _, _ = _active_credentials()
+    except PaystackConfigurationError:
         return False
-    expected = hmac.new(settings.PAYSTACK_SECRET_KEY.encode('utf-8'), raw_body, hashlib.sha512).hexdigest()
+    if not legacy:
+        return False
+    expected = hmac.new(secret_key.encode('utf-8'), raw_body, hashlib.sha512).hexdigest()
     return hmac.compare_digest(expected, legacy)

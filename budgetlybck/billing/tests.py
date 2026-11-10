@@ -848,31 +848,66 @@ class PaystackPhaseTwoTests(APITestCase):
         self.assertFalse(verification_response.data['has_lifetime_access'])
 
 
-@override_settings(DEBUG=True, PAYSTACK_MODE='test', PAYSTACK_SECRET_KEY='sk_test_example', PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_test_secret', PAYSTACK_CALLBACK_URL='http://localhost:8000/api/billing/paystack/callback/')
+@override_settings(DEBUG=True, PAYSTACK_MODE='test', PAYSTACK_TEST_SECRET_KEY='sk_test_example', PAYSTACK_TEST_WEBHOOK_SIGNING_SECRET='whsec_test_secret', PAYSTACK_CALLBACK_URL='http://localhost:8000/api/billing/paystack/callback/')
 class PaystackServiceTests(TestCase):
     @override_settings(
         DEBUG=False,
         PAYSTACK_MODE='live',
-        PAYSTACK_SECRET_KEY='sk_live_example',
-        PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_live_secret',
+        PAYSTACK_LIVE_SECRET_KEY='sk_live_example',
+        PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET='whsec_live_secret',
         PAYSTACK_CALLBACK_URL='https://api.example.test/api/billing/paystack/callback/',
         FRONTEND_PAYMENT_RETURN_URL='https://app.example.test/payment/complete',
     )
     def test_live_configuration_requires_matching_key_signing_secret_and_https_callback(self):
         self.assertEqual(get_config().secret_key, 'sk_live_example')
 
-        with self.settings(PAYSTACK_SECRET_KEY='sk_test_wrong'):
+        with self.settings(PAYSTACK_LIVE_SECRET_KEY='sk_test_wrong'):
             with self.assertRaises(PaystackConfigurationError):
                 get_config()
-        with self.settings(PAYSTACK_SECRET_KEY='sk_live_example', PAYSTACK_WEBHOOK_SIGNING_SECRET=''):
+        with self.settings(PAYSTACK_LIVE_SECRET_KEY='sk_live_example', PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET=''):
             with self.assertRaises(PaystackConfigurationError):
                 get_config()
-        with self.settings(PAYSTACK_SECRET_KEY='sk_live_example', PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_live_secret', PAYSTACK_CALLBACK_URL='http://api.example.test/callback/'):
+        with self.settings(PAYSTACK_LIVE_SECRET_KEY='sk_live_example', PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET='whsec_live_secret', PAYSTACK_CALLBACK_URL='http://api.example.test/callback/'):
             with self.assertRaises(PaystackConfigurationError):
                 get_config()
-        with self.settings(PAYSTACK_SECRET_KEY='sk_live_example', PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_live_secret', PAYSTACK_CALLBACK_URL='https://api.example.test/callback/', FRONTEND_PAYMENT_RETURN_URL='http://app.example.test/payment/complete'):
+        with self.settings(PAYSTACK_LIVE_SECRET_KEY='sk_live_example', PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET='whsec_live_secret', PAYSTACK_CALLBACK_URL='https://api.example.test/callback/', FRONTEND_PAYMENT_RETURN_URL='http://app.example.test/payment/complete'):
             with self.assertRaises(PaystackConfigurationError):
                 get_config()
+
+    @override_settings(
+        PAYSTACK_MODE='live',
+        PAYSTACK_SECRET_KEY='sk_test_legacy_only',
+        PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_test_legacy_only',
+        PAYSTACK_TEST_SECRET_KEY='sk_test_isolated',
+        PAYSTACK_TEST_WEBHOOK_SIGNING_SECRET='whsec_test_isolated',
+        PAYSTACK_LIVE_SECRET_KEY='sk_live_selected',
+        PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET='whsec_live_selected',
+        PAYSTACK_CALLBACK_URL='https://api.example.test/api/billing/paystack/callback/',
+        FRONTEND_PAYMENT_RETURN_URL='https://app.example.test/payment/complete',
+    )
+    def test_live_mode_selects_only_live_credentials_when_both_sets_exist(self):
+        self.assertEqual(get_config().secret_key, 'sk_live_selected')
+
+        raw = b'{"event":"charge.success"}'
+        timestamp = int(time.time())
+        signature = hmac.new(
+            b'whsec_live_selected', f'{timestamp}.'.encode('ascii') + raw, hashlib.sha512
+        ).hexdigest()
+        self.assertTrue(webhook_signature_valid(raw, {'Paystack-Signature': f't={timestamp},v1={signature}'}))
+
+    @override_settings(
+        PAYSTACK_MODE='live',
+        PAYSTACK_SECRET_KEY='sk_test_legacy_only',
+        PAYSTACK_WEBHOOK_SIGNING_SECRET='whsec_test_legacy_only',
+        PAYSTACK_LIVE_SECRET_KEY='',
+        PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET='',
+        PAYSTACK_CALLBACK_URL='https://api.example.test/api/billing/paystack/callback/',
+        FRONTEND_PAYMENT_RETURN_URL='https://app.example.test/payment/complete',
+    )
+    def test_live_mode_never_falls_back_to_legacy_or_test_credentials(self):
+        with self.assertRaises(PaystackConfigurationError):
+            get_config()
+        self.assertFalse(webhook_signature_valid(b'{}', {'Paystack-Signature': 't=1,v1=invalid'}))
 
     @patch('billing.services.paystack.requests.request')
     def test_service_uses_timeout_and_handles_provider_response(self, request):

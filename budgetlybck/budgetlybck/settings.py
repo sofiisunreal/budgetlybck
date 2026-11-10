@@ -222,12 +222,19 @@ BILLING_LIFETIME_OFFER_NAME = os.getenv('BILLING_LIFETIME_OFFER_NAME', 'Budgetly
 # true only after founding-user grants and end-to-end payment testing finish.
 BILLING_ENFORCE_LIFETIME_ACCESS = env_bool('BILLING_ENFORCE_LIFETIME_ACCESS', False)
 
-# Set PAYSTACK_MODE=live only after the live secret, signing secret, HTTPS
-# callback and Paystack dashboard webhook have been configured together.
+# Test and live credentials are intentionally distinct.  The legacy generic
+# variables remain a test-mode-only compatibility path while deployments move
+# to the explicit names below; live mode never falls back to them.
 PAYSTACK_MODE = os.getenv('PAYSTACK_MODE', 'test')
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY', '')
 PAYSTACK_WEBHOOK_SIGNING_SECRET = os.getenv('PAYSTACK_WEBHOOK_SIGNING_SECRET', '')
 PAYSTACK_WEBHOOK_PREVIOUS_SIGNING_SECRET = os.getenv('PAYSTACK_WEBHOOK_PREVIOUS_SIGNING_SECRET', '')
+PAYSTACK_TEST_SECRET_KEY = os.getenv('PAYSTACK_TEST_SECRET_KEY', '')
+PAYSTACK_TEST_WEBHOOK_SIGNING_SECRET = os.getenv('PAYSTACK_TEST_WEBHOOK_SIGNING_SECRET', '')
+PAYSTACK_TEST_WEBHOOK_PREVIOUS_SIGNING_SECRET = os.getenv('PAYSTACK_TEST_WEBHOOK_PREVIOUS_SIGNING_SECRET', '')
+PAYSTACK_LIVE_SECRET_KEY = os.getenv('PAYSTACK_LIVE_SECRET_KEY', '')
+PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET = os.getenv('PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET', '')
+PAYSTACK_LIVE_WEBHOOK_PREVIOUS_SIGNING_SECRET = os.getenv('PAYSTACK_LIVE_WEBHOOK_PREVIOUS_SIGNING_SECRET', '')
 PAYSTACK_ALLOW_LEGACY_WEBHOOK_SIGNATURE = env_bool('PAYSTACK_ALLOW_LEGACY_WEBHOOK_SIGNATURE', False)
 PAYSTACK_CALLBACK_URL = os.getenv('PAYSTACK_CALLBACK_URL', 'http://localhost:8000/api/billing/paystack/callback/')
 FRONTEND_PAYMENT_RETURN_URL = os.getenv('FRONTEND_PAYMENT_RETURN_URL', 'http://localhost:5173/payment/complete')
@@ -235,6 +242,15 @@ PAYSTACK_CONNECT_TIMEOUT_SECONDS = float(os.getenv('PAYSTACK_CONNECT_TIMEOUT_SEC
 PAYSTACK_READ_TIMEOUT_SECONDS = float(os.getenv('PAYSTACK_READ_TIMEOUT_SECONDS', '10'))
 PAYSTACK_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv('PAYSTACK_WEBHOOK_TOLERANCE_SECONDS', '300'))
 PAYSTACK_PENDING_ATTEMPT_MINUTES = int(os.getenv('PAYSTACK_PENDING_ATTEMPT_MINUTES', '15'))
+
+if PAYSTACK_MODE not in {'test', 'live'}:
+    raise ImproperlyConfigured('PAYSTACK_MODE must be either "test" or "live".')
+if PAYSTACK_MODE == 'live' and (
+    not PAYSTACK_LIVE_SECRET_KEY or not PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET
+):
+    raise ImproperlyConfigured(
+        'PAYSTACK_LIVE_SECRET_KEY and PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET are required in live mode.'
+    )
 
 if not DEBUG:
     SECURE_SSL_REDIRECT = env_bool('DJANGO_SECURE_SSL_REDIRECT', True)
