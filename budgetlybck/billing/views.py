@@ -68,15 +68,18 @@ def access_data(user):
 
 
 def live_checkout_allowed(user):
-    """Fail closed unless this account is explicitly approved for Live checkout."""
+    """Allow public Live checkout only when enabled and no allowlist is set."""
     if settings.PAYSTACK_MODE != 'live':
         return True
     allowed_ids = settings.BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS
-    return bool(
-        settings.BILLING_LIVE_CHECKOUT_ENABLED
-        and isinstance(allowed_ids, (set, frozenset))
-        and user.pk in allowed_ids
-    )
+    if not settings.BILLING_LIVE_CHECKOUT_ENABLED:
+        return False
+    # ``None`` is produced only by malformed allowlist input and deliberately
+    # remains fail-closed. An omitted/empty allowlist is the explicit public
+    # launch mode; a non-empty set retains the controlled-rollout restriction.
+    if not isinstance(allowed_ids, (set, frozenset)):
+        return False
+    return not allowed_ids or user.pk in allowed_ids
 
 
 class BillingAccessView(APIView):

@@ -486,7 +486,7 @@ class LiveCheckoutRestrictionTests(APITestCase):
         self.assertFalse(PaystackPurchaseAttempt.objects.exists())
 
     @patch('billing.views.initialize_transaction')
-    def test_live_checkout_requires_authenticated_user_id_allowlist(self, initialize):
+    def test_nonempty_live_checkout_allowlist_restricts_to_authenticated_user_id(self, initialize):
         with self.settings(
             BILLING_LIVE_CHECKOUT_ENABLED=True,
             BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=frozenset({self.other_user.pk}),
@@ -496,17 +496,31 @@ class LiveCheckoutRestrictionTests(APITestCase):
         initialize.assert_not_called()
 
     @patch('billing.views.initialize_transaction')
-    def test_invalid_or_empty_allowlist_fails_closed(self, initialize):
-        for allowed_ids in (None, frozenset()):
-            with self.settings(
-                BILLING_LIVE_CHECKOUT_ENABLED=True,
-                BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=allowed_ids,
-            ):
-                response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
-            self.assert_restricted(response)
+    def test_invalid_allowlist_fails_closed(self, initialize):
+        with self.settings(
+            BILLING_LIVE_CHECKOUT_ENABLED=True,
+            BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=None,
+        ):
+            response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+        self.assert_restricted(response)
         initialize.assert_not_called()
 
+    @patch('billing.views.initialize_transaction')
+    def test_enabled_live_checkout_without_allowlist_allows_authenticated_unpaid_user(self, initialize):
+        initialize.side_effect = lambda **kwargs: {
+            'reference': kwargs['reference'], 'authorization_url': 'https://checkout.example.test/live',
+        }
+        with self.settings(
+            BILLING_LIVE_CHECKOUT_ENABLED=True,
+            BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=frozenset(),
+        ):
+            response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(PaystackPurchaseAttempt.objects.get().user_id, self.user.pk)
+
     def test_invalid_allowlist_values_are_rejected_by_settings_parser(self):
+        with patch.dict(os.environ, {'BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS': ''}):
+            self.assertEqual(env_positive_int_set('BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS'), frozenset())
         with patch.dict(os.environ, {'BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS': '5,not-an-id'}):
             self.assertIsNone(env_positive_int_set('BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS'))
         with patch.dict(os.environ, {'BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS': '0'}):

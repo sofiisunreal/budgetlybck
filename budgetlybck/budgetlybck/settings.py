@@ -253,8 +253,9 @@ BILLING_LIFETIME_OFFER_NAME = os.getenv('BILLING_LIFETIME_OFFER_NAME', 'Budgetly
 # Phase 4 is deliberately deployable without changing present access. Set to
 # true only after founding-user grants and end-to-end payment testing finish.
 BILLING_ENFORCE_LIFETIME_ACCESS = env_bool('BILLING_ENFORCE_LIFETIME_ACCESS', False)
-# Live checkout remains closed until an operator enables it and names the
-# small set of users authorized for the controlled first payments.
+# Live checkout is closed by default. When enabled, an omitted/empty allowlist
+# opens checkout publicly; a non-empty allowlist supports a controlled rollout.
+# Malformed allowlist values are represented by None and fail closed in the view.
 BILLING_LIVE_CHECKOUT_ENABLED = env_bool('BILLING_LIVE_CHECKOUT_ENABLED', False)
 BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS = env_positive_int_set('BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS')
 
