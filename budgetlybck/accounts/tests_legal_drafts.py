@@ -9,6 +9,23 @@ from .models import PolicyDocument
 
 
 class LegalDocumentDraftTests(TestCase):
+    def test_v12_pair_uses_today_effective_timestamp_without_writing_records(self):
+        drafts = Path(settings.BASE_DIR) / 'legal_documents' / 'drafts'
+        output = StringIO()
+
+        call_command(
+            'publish_policy_documents',
+            '--terms-file', str(drafts / 'terms-of-service-v1.2.md'),
+            '--privacy-file', str(drafts / 'privacy-policy-v1.2.md'),
+            '--policy-version', '1.2',
+            '--effective-at', '2026-11-10T21:00:00Z',
+            '--dry-run',
+            stdout=output,
+        )
+
+        self.assertIn('Would Import Terms and Privacy version 1.2', output.getvalue())
+        self.assertFalse(PolicyDocument.objects.filter(version='1.2').exists())
+
     def test_v11_drafts_contain_the_approved_launch_disclosures(self):
         drafts = Path(settings.BASE_DIR) / 'legal_documents' / 'drafts'
         terms = (drafts / 'terms-of-service-v1.1.md').read_text(encoding='utf-8')
