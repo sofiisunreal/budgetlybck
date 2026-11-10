@@ -1,7 +1,8 @@
 # Budgetly Terms of Service
 
-**Version:** 1.1 (draft — not published)  
-**Effective date:** To be confirmed before publication
+**Version:** 1.1
+
+**Effective date:** November 12, 2026
 
 ## 1. Agreement to These Terms
 
@@ -43,7 +44,7 @@ Budgetly offers one personal-account purchase: **KES 1,050, paid once through Pa
 
 “Lifetime access” means access to Budgetly for as long as Budgetly continues to make the service available, subject to these Terms and applicable law. It does not guarantee perpetual operation, uninterrupted availability, or that every feature will remain unchanged.
 
-Before you authorize payment, the checkout should show the amount due and currency. The Budgetly access price is KES 1,050. This draft does not make any statement about taxes, bank charges, mobile-money charges, or other payment-method charges that Budgetly has not confirmed.
+Before you authorize payment, the checkout shows the amount due and currency. The total customer payment charged by Budgetly is KES 1,050. Budgetly does not add any additional checkout charges to this purchase. This statement does not describe charges, if any, imposed independently by a bank, mobile-money provider, card issuer, or other payment method.
 
 Paystack processes checkout payments. A payment-return page or browser redirect is not itself proof of payment; Budgetly confirms payment server-side before granting access.
 

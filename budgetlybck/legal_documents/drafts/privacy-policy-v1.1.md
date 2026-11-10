@@ -1,7 +1,8 @@
 # Budgetly Privacy Policy
 
-**Version:** 1.1 (draft — not published)  
-**Effective date:** To be confirmed before publication
+**Version:** 1.1
+
+**Effective date:** November 12, 2026
 
 ## 1. Introduction
 
@@ -34,7 +35,7 @@ When you request support or submit feedback, Budgetly may process your contact i
 
 ### 2.5 Payment information
 
-Budgetly uses **Paystack** to process the KES 1,050 one-time lifetime-access purchase. Budgetly retains limited payment-administration information, including the Budgetly purchase reference, expected amount and currency, payment status, provider transaction identifier, and non-sensitive provider-response details needed for reconciliation, fraud prevention, refund, or dispute handling.
+Budgetly uses **Paystack** to process the KES 1,050 one-time lifetime-access purchase. The total customer payment charged by Budgetly at checkout is KES 1,050, and Budgetly does not add separate checkout charges. Budgetly retains limited payment-administration information, including the Budgetly purchase reference, expected amount and currency, payment status, provider transaction identifier, and non-sensitive provider-response details needed for reconciliation, fraud prevention, refund, or dispute handling.
 
 Budgetly does not store full card, bank-account, or payment-PIN details. Paystack processes payment information under its own terms and privacy practices.
 
