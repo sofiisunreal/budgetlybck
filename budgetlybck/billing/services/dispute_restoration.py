@@ -1,6 +1,7 @@
 """Audited, provider-verified restoration of a suspended entitlement."""
 
 from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -66,6 +67,8 @@ def approve_restoration(*, purchase_reference, operator, evidence_reference, rea
             raise DisputeRestorationError('Purchase ownership no longer matches the entitlement.')
         if entitlement.status != LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED:
             raise DisputeRestorationError('Only suspended entitlements can be approved for restoration.')
+        if attempt.provider_mode not in {'test', 'live'} or attempt.provider_mode != settings.PAYSTACK_MODE:
+            raise DisputeRestorationError('The purchase environment does not match the configured Paystack mode.')
         if attempt.status != PaystackPurchaseAttempt.SUCCESSFUL:
             raise DisputeRestorationError('Only a currently verified successful purchase can be restored.')
         if not attempt.provider_transaction_id or attempt.status == PaystackPurchaseAttempt.REVERSED:
@@ -82,6 +85,7 @@ def approve_restoration(*, purchase_reference, operator, evidence_reference, rea
             entitlement=entitlement,
             user=attempt.user,
             provider_transaction_id=attempt.provider_transaction_id,
+            provider_mode=attempt.provider_mode,
             approved_by=operator,
             approved_by_identifier=operator_identifier(operator),
             evidence_reference=evidence_reference,
@@ -110,6 +114,12 @@ def execute_restoration(*, decision_id, operator, provider_data, disputes):
             raise DisputeRestorationError('The user, purchase, or entitlement no longer match the decision.')
         if attempt.reference != decision.purchase_reference or attempt.provider_transaction_id != decision.provider_transaction_id:
             raise DisputeRestorationError('Provider transaction facts no longer match the approved decision.')
+        if (
+            decision.provider_mode not in {'test', 'live'}
+            or attempt.provider_mode != decision.provider_mode
+            or attempt.provider_mode != settings.PAYSTACK_MODE
+        ):
+            raise DisputeRestorationError('The purchase environment does not match the approved restoration decision.')
         if entitlement.status != LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED:
             raise DisputeRestorationError('The entitlement is no longer suspended.')
         if attempt.status != PaystackPurchaseAttempt.SUCCESSFUL:

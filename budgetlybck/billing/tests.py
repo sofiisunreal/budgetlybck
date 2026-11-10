@@ -1,13 +1,16 @@
 from datetime import datetime, timezone as datetime_timezone
 import hashlib
 import hmac
+import importlib
 from io import StringIO
 import json
+import os
 import time
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.core.management import CommandError, call_command
 from django.db import IntegrityError
@@ -27,7 +30,8 @@ from .services.paystack import (PaystackConfigurationError, PaystackUnavailableE
 from .services.dispute_restoration import (DisputeRestorationError,
                                            approve_restoration,
                                            execute_restoration)
-from .services.access import PurchaseVerificationError
+from .services.access import (PurchaseVerificationError, apply_reversal,
+                              apply_verification)
 from .views import PaystackWebhookView, PurchaseInitializeView
 
 
@@ -218,6 +222,202 @@ class LifetimeAccessEnforcementTests(APITestCase):
         self.client.force_authenticate(user=None)
         response = self.client.get('/api/accounts/')
         self.assertEqual(response.status_code, 401)
+
+
+@override_settings(BILLING_ENFORCE_LIFETIME_ACCESS=True, PAYSTACK_MODE='test')
+class PaymentEnvironmentIsolationTests(APITestCase):
+    """Test and Live billing facts must never activate each other."""
+
+    live_settings = {
+        'PAYSTACK_MODE': 'live',
+        'PAYSTACK_LIVE_SECRET_KEY': 'sk_live_environment_test',
+        'PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET': 'whsec_live_environment_test',
+        'PAYSTACK_CALLBACK_URL': 'https://api.example.test/api/billing/paystack/callback/',
+        'FRONTEND_PAYMENT_RETURN_URL': 'https://app.example.test/payment/complete',
+    }
+
+    def setUp(self):
+        self.user = User.objects.create_user('environment-user', 'environment@example.com', 'SafePassword123!')
+        self.account = Account.objects.create(user=self.user, name='Cash', account_type='cash', currency='KES')
+        self.offer = LifetimeAccessOffer.objects.create(
+            name='Environment offer', price_minor=105000, currency='KES', is_active=True,
+        )
+        self.client.force_authenticate(self.user)
+
+    def attempt(self, mode, **overrides):
+        values = {
+            'user': self.user,
+            'offer': self.offer,
+            'expected_amount_minor': 105000,
+            'expected_currency': 'KES',
+            'provider_mode': mode,
+        }
+        values.update(overrides)
+        return PaystackPurchaseAttempt.objects.create(**values)
+
+    @staticmethod
+    def provider_data(attempt, provider_id):
+        return {
+            'id': provider_id,
+            'reference': attempt.reference,
+            'status': 'success',
+            'amount': 105000,
+            'currency': 'KES',
+        }
+
+    def test_test_and_live_entitlements_are_distinct_and_access_is_mode_specific(self):
+        test_attempt = self.attempt('test')
+        apply_verification(test_attempt.reference, self.provider_data(test_attempt, 1001))
+        self.assertTrue(has_lifetime_access(self.user))
+        self.assertEqual(self.client.get('/api/accounts/').status_code, 200)
+
+        with self.settings(**self.live_settings):
+            self.assertFalse(has_lifetime_access(self.user))
+            self.assertEqual(self.client.get('/api/accounts/').status_code, 403)
+            with self.assertRaises(PurchaseVerificationError):
+                apply_verification(test_attempt.reference, self.provider_data(test_attempt, 1001))
+
+            live_attempt = self.attempt('live')
+            apply_verification(live_attempt.reference, self.provider_data(live_attempt, 1001))
+            self.assertTrue(has_lifetime_access(self.user))
+            self.assertEqual(self.client.get('/api/accounts/').status_code, 200)
+
+        self.assertTrue(has_lifetime_access(self.user))
+        self.assertEqual(
+            set(LifetimeAccessEntitlement.objects.filter(user=self.user).values_list('provider_mode', flat=True)),
+            {'test', 'live'},
+        )
+
+    def test_test_pending_attempt_does_not_block_live_checkout(self):
+        self.attempt('test', status=PaystackPurchaseAttempt.PENDING)
+        with self.settings(**self.live_settings):
+            with patch('billing.views.initialize_transaction') as initialize:
+                initialize.side_effect = lambda **kwargs: {
+                    'reference': kwargs['reference'], 'authorization_url': 'https://checkout.example.test/live',
+                }
+                response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        created = PaystackPurchaseAttempt.objects.get(reference=response.data['reference'])
+        self.assertEqual(created.provider_mode, 'live')
+
+    def test_cross_mode_webhook_and_refund_cannot_mutate_test_purchase(self):
+        test_attempt = self.attempt('test', status=PaystackPurchaseAttempt.SUCCESSFUL, provider_transaction_id='1002')
+        entitlement = LifetimeAccessEntitlement.objects.create(
+            user=self.user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=test_attempt,
+            provider_mode='test',
+        )
+        with self.settings(**self.live_settings):
+            with self.assertRaises(PurchaseVerificationError):
+                apply_reversal(test_attempt.reference, 'refund.processed', {
+                    'id': 9, 'amount': '105000', 'currency': 'KES',
+                })
+
+            event = {'event': 'charge.success', 'data': {'id': 1002, 'reference': test_attempt.reference}}
+            raw, signature = self.signed_live_webhook(event)
+            with patch(
+                'billing.views.verify_and_activate_purchase',
+                side_effect=lambda reference: apply_verification(
+                    reference, self.provider_data(test_attempt, 1002),
+                ),
+            ):
+                response = self.client.post(
+                    '/api/billing/paystack/webhook/', raw, content_type='application/json',
+                    HTTP_PAYSTACK_SIGNATURE=signature,
+                )
+
+        test_attempt.refresh_from_db()
+        entitlement.refresh_from_db()
+        event = PaystackWebhookEvent.objects.get()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((event.provider_mode, event.processing_status), ('live', PaystackWebhookEvent.FAILED))
+        self.assertEqual(test_attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertEqual(entitlement.status, LifetimeAccessEntitlement.ACTIVE)
+
+    def test_unclassified_historical_purchase_never_grants_access(self):
+        historical = self.attempt('test')
+        PaystackPurchaseAttempt.objects.filter(pk=historical.pk).update(provider_mode=None)
+        historical.refresh_from_db()
+
+        with self.assertRaises(PurchaseVerificationError):
+            apply_verification(historical.reference, self.provider_data(historical, 1003))
+        self.assertFalse(has_lifetime_access(self.user))
+
+    @staticmethod
+    def signed_live_webhook(event):
+        raw = json.dumps(event, separators=(',', ':')).encode('utf-8')
+        timestamp = int(time.time())
+        digest = hmac.new(
+            b'whsec_live_environment_test', f'{timestamp}.'.encode('ascii') + raw, hashlib.sha512,
+        ).hexdigest()
+        return raw, f't={timestamp},v1=whk_live:{digest}'
+
+
+class PaymentEnvironmentMigrationTests(TestCase):
+    """Exercise the guarded historical Test-mode classification step."""
+
+    def setUp(self):
+        self.user = User.objects.create_user('historical-mode', 'historical-mode@example.com', 'SafePassword123!')
+        self.offer = LifetimeAccessOffer.objects.create(
+            name='Historical mode offer', price_minor=105000, currency='KES', is_active=True,
+        )
+        self.attempt = PaystackPurchaseAttempt.objects.create(
+            user=self.user, offer=self.offer, expected_amount_minor=105000,
+            expected_currency='KES', status=PaystackPurchaseAttempt.SUCCESSFUL,
+            provider_transaction_id='historical-provider-id', provider_mode='test',
+        )
+        self.entitlement = LifetimeAccessEntitlement.objects.create(
+            user=self.user, source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=self.attempt, provider_mode='test',
+        )
+        self.webhook = PaystackWebhookEvent.objects.create(
+            deduplication_key='test:charge.success:historical', event_type='charge.success',
+            payload_digest='a' * 64, provider_mode='test',
+        )
+        operator = User.objects.create_user('historical-operator', 'historical-operator@example.com', 'SafePassword123!', is_staff=True)
+        self.decision = EntitlementRestorationDecision.objects.create(
+            purchase=self.attempt, purchase_reference=self.attempt.reference,
+            entitlement=self.entitlement, user=self.user,
+            provider_transaction_id='historical-provider-id', provider_mode='test',
+            approved_by=operator, approved_by_identifier=f'{operator.pk}:{operator.username}',
+            evidence_reference='HISTORICAL-TEST', reason='Historical Test-mode fixture.',
+            previous_status=LifetimeAccessEntitlement.ACTIVE,
+        )
+        PaystackPurchaseAttempt.objects.filter(pk=self.attempt.pk).update(provider_mode=None)
+        LifetimeAccessEntitlement.objects.filter(pk=self.entitlement.pk).update(provider_mode=None)
+        PaystackWebhookEvent.objects.filter(pk=self.webhook.pk).update(provider_mode=None)
+        EntitlementRestorationDecision.objects.filter(pk=self.decision.pk).update(provider_mode=None)
+        self.migration = importlib.import_module('billing.migrations.0005_payment_environment_isolation')
+
+    def test_unconfirmed_historical_records_remain_unclassified(self):
+        with patch.dict(os.environ, {'BILLING_CONFIRM_HISTORICAL_PAYSTACK_TEST_ONLY': ''}):
+            self.migration.classify_historical_paystack_records(apps)
+
+        self.attempt.refresh_from_db()
+        self.entitlement.refresh_from_db()
+        self.webhook.refresh_from_db()
+        self.decision.refresh_from_db()
+        self.assertEqual(
+            (self.attempt.provider_mode, self.entitlement.provider_mode, self.webhook.provider_mode, self.decision.provider_mode),
+            (None, None, None, None),
+        )
+        self.assertFalse(has_lifetime_access(self.user))
+
+    def test_explicit_test_only_confirmation_classifies_related_historical_records(self):
+        with patch.dict(os.environ, {'BILLING_CONFIRM_HISTORICAL_PAYSTACK_TEST_ONLY': 'yes'}):
+            self.migration.classify_historical_paystack_records(apps)
+
+        self.attempt.refresh_from_db()
+        self.entitlement.refresh_from_db()
+        self.webhook.refresh_from_db()
+        self.decision.refresh_from_db()
+        self.assertEqual(
+            (self.attempt.provider_mode, self.entitlement.provider_mode, self.webhook.provider_mode, self.decision.provider_mode),
+            ('test', 'test', 'test', 'test'),
+        )
+        self.assertTrue(has_lifetime_access(self.user))
 
 
 class BillingManagementCommandTests(TestCase):

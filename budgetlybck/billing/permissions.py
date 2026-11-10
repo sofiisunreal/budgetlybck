@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.db import models
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import BasePermission
 
@@ -9,7 +10,18 @@ def has_lifetime_access(user):
     return bool(
         user
         and user.is_authenticated
-        and LifetimeAccessEntitlement.objects.filter(user=user, status=LifetimeAccessEntitlement.ACTIVE).exists()
+        and LifetimeAccessEntitlement.objects.filter(
+            user=user,
+            status=LifetimeAccessEntitlement.ACTIVE,
+        ).filter(
+            # Founding-user grants are deliberately independent of Paystack;
+            # a null mode on a Paystack entitlement is never accepted.
+            models.Q(source=LifetimeAccessEntitlement.LEGACY_GRANT)
+            | models.Q(
+                source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+                provider_mode=settings.PAYSTACK_MODE,
+            )
+        ).exists()
     )
 
 

@@ -6,7 +6,7 @@ from urllib.parse import urlencode, urlparse
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, models, transaction
 from django.http import HttpResponseRedirect
 from django.utils import timezone
 from rest_framework import status
@@ -39,14 +39,17 @@ def active_offer():
 
 def purchase_data(attempt):
     return {
-        'reference': attempt.reference, 'status': attempt.status,
+        'reference': attempt.reference, 'status': attempt.status, 'provider_mode': attempt.provider_mode,
         'expected_amount_minor': attempt.expected_amount_minor, 'expected_currency': attempt.expected_currency,
         'initialized_at': attempt.initialized_at, 'verified_at': attempt.verified_at, 'created_at': attempt.created_at,
     }
 
 
 def access_data(user):
-    entitlement = LifetimeAccessEntitlement.objects.filter(user=user).first()
+    entitlement = LifetimeAccessEntitlement.objects.filter(user=user).filter(
+        models.Q(source=LifetimeAccessEntitlement.LEGACY_GRANT)
+        | models.Q(source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE, provider_mode=settings.PAYSTACK_MODE)
+    ).first()
     active = bool(entitlement and entitlement.status == LifetimeAccessEntitlement.ACTIVE)
     return {'has_lifetime_access': active, 'entitlement_status': entitlement.status if entitlement else None, 'purchase_required': not active}
 
@@ -76,12 +79,14 @@ class PurchaseInitializeView(APIView):
             cooldown = timezone.now() - timedelta(minutes=settings.PAYSTACK_PENDING_ATTEMPT_MINUTES)
             if PaystackPurchaseAttempt.objects.filter(
                 user=user,
+                provider_mode=settings.PAYSTACK_MODE,
                 status__in=[PaystackPurchaseAttempt.INITIALIZED, PaystackPurchaseAttempt.PENDING],
                 created_at__gte=cooldown,
             ).exists():
                 return Response({'detail': 'A payment attempt is already in progress. Verify its status before starting another checkout.'}, status=status.HTTP_409_CONFLICT)
             attempt = PaystackPurchaseAttempt.objects.create(
-                user=user, offer=offer, expected_amount_minor=offer.price_minor, expected_currency=offer.currency
+                user=user, offer=offer, expected_amount_minor=offer.price_minor,
+                expected_currency=offer.currency, provider_mode=settings.PAYSTACK_MODE,
             )
         try:
             checkout = initialize_transaction(
@@ -191,12 +196,16 @@ class PaystackWebhookView(APIView):
             return Response({'detail': 'Invalid webhook payload.'}, status=status.HTTP_400_BAD_REQUEST)
 
         reference, provider_id = event_transaction_reference(data), str(data.get('id') or '')
+        provider_mode = settings.PAYSTACK_MODE
         key_component = provider_id or reference or payload_digest(raw_body)
-        deduplication_key = f'{event_type}:{key_component}'
+        deduplication_key = f'{provider_mode}:{event_type}:{key_component}'
         try:
             webhook_event, _ = PaystackWebhookEvent.objects.get_or_create(
                 deduplication_key=deduplication_key,
-                defaults={'event_type': event_type, 'transaction_reference': reference, 'payload_digest': payload_digest(raw_body)},
+                defaults={
+                    'event_type': event_type, 'provider_mode': provider_mode,
+                    'transaction_reference': reference, 'payload_digest': payload_digest(raw_body),
+                },
             )
         except IntegrityError:
             webhook_event = PaystackWebhookEvent.objects.get(deduplication_key=deduplication_key)

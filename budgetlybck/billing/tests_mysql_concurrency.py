@@ -106,6 +106,7 @@ class MySQLPaystackConcurrencyTests(TransactionTestCase):
 
         self.assertEqual(results.count(True), 1)
         self.assertEqual(LifetimeAccessEntitlement.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(LifetimeAccessEntitlement.objects.get(user=self.user).provider_mode, 'test')
         attempt.refresh_from_db()
         self.assertEqual(attempt.status, PaystackPurchaseAttempt.SUCCESSFUL)
 

@@ -20,8 +20,8 @@ class LifetimeAccessOfferAdmin(admin.ModelAdmin):
 
 @admin.register(PaystackPurchaseAttempt)
 class PaystackPurchaseAttemptAdmin(admin.ModelAdmin):
-    list_display = ('reference', 'user', 'expected_amount_minor', 'expected_currency', 'status', 'created_at')
-    list_filter = ('status', 'expected_currency')
+    list_display = ('reference', 'provider_mode', 'user', 'expected_amount_minor', 'expected_currency', 'status', 'created_at')
+    list_filter = ('provider_mode', 'status', 'expected_currency')
     search_fields = ('reference', 'provider_transaction_id', 'user__username', 'user__email')
     readonly_fields = [field.name for field in PaystackPurchaseAttempt._meta.fields]
 
@@ -48,8 +48,8 @@ class LifetimeAccessEntitlementAdmin(admin.ModelAdmin):
 
 @admin.register(PaystackWebhookEvent)
 class PaystackWebhookEventAdmin(admin.ModelAdmin):
-    list_display = ('event_type', 'transaction_reference', 'processing_status', 'received_at', 'processed_at')
-    list_filter = ('event_type', 'processing_status')
+    list_display = ('event_type', 'provider_mode', 'transaction_reference', 'processing_status', 'received_at', 'processed_at')
+    list_filter = ('provider_mode', 'event_type', 'processing_status')
     search_fields = ('transaction_reference', 'deduplication_key', 'payload_digest')
     readonly_fields = [field.name for field in PaystackWebhookEvent._meta.fields]
 
@@ -62,8 +62,8 @@ class PaystackWebhookEventAdmin(admin.ModelAdmin):
 
 @admin.register(EntitlementRestorationDecision)
 class EntitlementRestorationDecisionAdmin(admin.ModelAdmin):
-    list_display = ('decision_id', 'purchase_reference', 'state', 'previous_status', 'new_status', 'approved_at', 'executed_at')
-    list_filter = ('state', 'previous_status', 'new_status')
+    list_display = ('decision_id', 'provider_mode', 'purchase_reference', 'state', 'previous_status', 'new_status', 'approved_at', 'executed_at')
+    list_filter = ('provider_mode', 'state', 'previous_status', 'new_status')
     search_fields = ('decision_id', 'purchase_reference', 'provider_transaction_id', 'approved_by_identifier')
     readonly_fields = [field.name for field in EntitlementRestorationDecision._meta.fields]
 

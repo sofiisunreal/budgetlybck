@@ -1,5 +1,6 @@
 from django.core.exceptions import ValidationError
 from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
@@ -80,12 +81,17 @@ def apply_verification(reference, provider_data):
         raise PurchaseVerificationError('Paystack transaction status was invalid.')
     with transaction.atomic():
         attempt = PaystackPurchaseAttempt.objects.select_for_update().select_related('offer', 'user').get(reference=reference)
+        if attempt.provider_mode not in {'test', 'live'} or attempt.provider_mode != settings.PAYSTACK_MODE:
+            raise PurchaseVerificationError('Purchase environment did not match the configured Paystack mode.')
         provider_id = str(provider_data['id']) if provider_data.get('id') is not None else None
         if not provider_id:
             raise PurchaseVerificationError('Paystack transaction identifier was missing.')
         if attempt.provider_transaction_id and attempt.provider_transaction_id != provider_id:
             raise PurchaseVerificationError('Paystack transaction identifier changed unexpectedly.')
-        if provider_id and PaystackPurchaseAttempt.objects.exclude(pk=attempt.pk).filter(provider_transaction_id=provider_id).exists():
+        if provider_id and PaystackPurchaseAttempt.objects.exclude(pk=attempt.pk).filter(
+            provider_mode=attempt.provider_mode,
+            provider_transaction_id=provider_id,
+        ).exists():
             raise PurchaseVerificationError('Paystack transaction is already linked to another purchase.')
         if provider_data.get('amount') != attempt.expected_amount_minor:
             raise PurchaseVerificationError('Paystack amount did not match the purchase.')
@@ -112,7 +118,11 @@ def apply_verification(reference, provider_data):
         if user is None:
             return attempt, None, False
 
-        entitlement = LifetimeAccessEntitlement.objects.select_for_update().filter(user=user).first()
+        entitlement = LifetimeAccessEntitlement.objects.select_for_update().filter(
+            user=user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            provider_mode=attempt.provider_mode,
+        ).first()
         if entitlement:
             if metadata.get('dispute_review_required') and entitlement.status == LifetimeAccessEntitlement.ACTIVE:
                 entitlement.transition_to(LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
@@ -122,6 +132,7 @@ def apply_verification(reference, provider_data):
                 user=user,
                 source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
                 activating_purchase=attempt,
+                provider_mode=attempt.provider_mode,
                 status=(
                     LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED
                     if metadata.get('dispute_review_required')
@@ -129,7 +140,11 @@ def apply_verification(reference, provider_data):
                 ),
             )
         except IntegrityError:
-            entitlement = LifetimeAccessEntitlement.objects.select_for_update().get(user=attempt.user)
+            entitlement = LifetimeAccessEntitlement.objects.select_for_update().get(
+                user=attempt.user,
+                source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+                provider_mode=attempt.provider_mode,
+            )
             return attempt, entitlement, False
         return attempt, entitlement, True
 
@@ -138,6 +153,8 @@ def apply_reversal(reference, event_type, provider_data):
     """Apply only verified, unambiguous refund/dispute access effects."""
     with transaction.atomic():
         attempt = PaystackPurchaseAttempt.objects.select_for_update().get(reference=reference)
+        if attempt.provider_mode not in {'test', 'live'} or attempt.provider_mode != settings.PAYSTACK_MODE:
+            raise PurchaseVerificationError('Purchase environment did not match the configured Paystack mode.')
         entitlement = LifetimeAccessEntitlement.objects.select_for_update().filter(activating_purchase=attempt).first()
 
         if event_type == 'refund.processed':

@@ -10,6 +10,14 @@ def generate_purchase_reference():
     return f'bgt_{uuid.uuid4().hex}'
 
 
+def current_paystack_mode():
+    """Snapshot the configured provider environment for newly created records."""
+    return settings.PAYSTACK_MODE
+
+
+PAYSTACK_MODES = [('test', 'Test'), ('live', 'Live')]
+
+
 class LifetimeAccessOffer(models.Model):
     """A server-managed one-time lifetime-access offer."""
 
@@ -84,7 +92,10 @@ class PaystackPurchaseAttempt(models.Model):
     offer = models.ForeignKey(LifetimeAccessOffer, on_delete=models.PROTECT, related_name='purchase_attempts')
     expected_amount_minor = models.PositiveBigIntegerField()
     expected_currency = models.CharField(max_length=3)
-    provider_transaction_id = models.CharField(max_length=80, null=True, blank=True, unique=True)
+    # Null is reserved for historical rows that have not been explicitly
+    # classified. New attempts always snapshot the configured environment.
+    provider_mode = models.CharField(max_length=8, choices=PAYSTACK_MODES, null=True, default=current_paystack_mode, editable=False)
+    provider_transaction_id = models.CharField(max_length=80, null=True, blank=True)
     status = models.CharField(max_length=16, choices=STATUSES, default=INITIALIZED)
     initialized_at = models.DateTimeField(null=True, blank=True)
     verified_at = models.DateTimeField(null=True, blank=True)
@@ -98,6 +109,10 @@ class PaystackPurchaseAttempt(models.Model):
         ordering = ['-created_at']
         constraints = [
             models.CheckConstraint(check=models.Q(expected_amount_minor__gt=0), name='billing_attempt_amount_positive'),
+            models.UniqueConstraint(
+                fields=['provider_mode', 'provider_transaction_id'],
+                name='billing_attempt_mode_provider_transaction_unique',
+            ),
         ]
 
     def clean(self):
@@ -105,6 +120,8 @@ class PaystackPurchaseAttempt(models.Model):
             raise ValidationError({'expected_currency': 'Only KES purchases are supported.'})
         if self.expected_amount_minor <= 0:
             raise ValidationError({'expected_amount_minor': 'Expected amount must be positive.'})
+        if self.provider_mode not in {'test', 'live'}:
+            raise ValidationError({'provider_mode': 'A Paystack environment is required for new purchase attempts.'})
         if self.offer_id and (
             self.expected_amount_minor != self.offer.price_minor or self.expected_currency != self.offer.currency
         ):
@@ -137,9 +154,14 @@ class LifetimeAccessEntitlement(models.Model):
         REFUNDED: set(),
     }
 
-    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='lifetime_access_entitlement')
+    # A user can hold a Test entitlement and a separate Live entitlement.
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='lifetime_access_entitlements')
     status = models.CharField(max_length=24, choices=STATUSES, default=ACTIVE)
     source = models.CharField(max_length=24, choices=SOURCES)
+    # Legacy grants are deliberately mode-neutral; Paystack purchases must
+    # snapshot the verified environment and never use a null mode.
+    provider_mode = models.CharField(max_length=8, choices=PAYSTACK_MODES, null=True, default=current_paystack_mode, editable=False)
+    legacy_marker = models.PositiveSmallIntegerField(null=True, editable=False)
     activating_purchase = models.OneToOneField(
         PaystackPurchaseAttempt, null=True, blank=True, on_delete=models.PROTECT, related_name='activated_entitlement'
     )
@@ -151,16 +173,34 @@ class LifetimeAccessEntitlement(models.Model):
         constraints = [
             models.CheckConstraint(
                 check=(
-                    models.Q(source='legacy_grant', activating_purchase__isnull=True)
-                    | models.Q(source='paystack_purchase', activating_purchase__isnull=False)
+                    models.Q(
+                        source='legacy_grant', activating_purchase__isnull=True,
+                        provider_mode__isnull=True, legacy_marker=1,
+                    )
+                    | models.Q(
+                        source='paystack_purchase', activating_purchase__isnull=False,
+                        legacy_marker__isnull=True,
+                    ) & (
+                        models.Q(provider_mode__isnull=True)
+                        | models.Q(provider_mode__in=['test', 'live'])
+                    )
                 ),
                 name='billing_entitlement_source_purchase_match',
+            ),
+            models.UniqueConstraint(
+                fields=['user', 'provider_mode'],
+                name='billing_entitlement_user_provider_mode_unique',
+            ),
+            models.UniqueConstraint(
+                fields=['user', 'legacy_marker'],
+                name='billing_entitlement_user_legacy_unique',
             ),
         ]
 
     def clean(self):
-        if self.source == self.LEGACY_GRANT and self.activating_purchase_id is not None:
-            raise ValidationError('Legacy grants cannot have an activating purchase.')
+        if self.source == self.LEGACY_GRANT:
+            if self.activating_purchase_id is not None or self.provider_mode is not None or self.legacy_marker != 1:
+                raise ValidationError('Legacy grants must be mode-neutral and cannot have an activating purchase.')
         if self.source == self.PAYSTACK_PURCHASE:
             if self.activating_purchase_id is None:
                 raise ValidationError('Paystack entitlements require an activating purchase.')
@@ -171,6 +211,8 @@ class LifetimeAccessEntitlement(models.Model):
                 raise ValidationError('Only successful purchases can activate entitlement.')
             if self.user_id and self.activating_purchase.user_id != self.user_id:
                 raise ValidationError('An activating purchase must belong to the entitlement user.')
+            if self.provider_mode not in {'test', 'live'} or self.provider_mode != self.activating_purchase.provider_mode:
+                raise ValidationError('A Paystack entitlement must match its purchase environment.')
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -190,10 +232,16 @@ class LifetimeAccessEntitlement(models.Model):
         """Idempotently grant access without changing an existing entitlement."""
         with transaction.atomic():
             locked_user = type(user).objects.select_for_update().get(pk=user.pk)
-            entitlement, created = cls.objects.select_for_update().get_or_create(
-                user=locked_user,
-                defaults={'source': cls.LEGACY_GRANT, 'status': cls.ACTIVE},
+            # A previous paid entitlement is already sufficient and must not
+            # be replaced or downgraded by the founding-user process.
+            entitlement = cls.objects.select_for_update().filter(user=locked_user).first()
+            if entitlement:
+                return entitlement, False
+            entitlement = cls.objects.create(
+                user=locked_user, source=cls.LEGACY_GRANT, status=cls.ACTIVE,
+                provider_mode=None, legacy_marker=1,
             )
+            created = True
         return entitlement, created
 
     def __str__(self):
@@ -229,6 +277,7 @@ class EntitlementRestorationDecision(models.Model):
         related_name='entitlement_restoration_decisions',
     )
     provider_transaction_id = models.CharField(max_length=80, editable=False)
+    provider_mode = models.CharField(max_length=8, choices=PAYSTACK_MODES, null=True, default=current_paystack_mode, editable=False)
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -265,6 +314,8 @@ class EntitlementRestorationDecision(models.Model):
             raise ValidationError('Decision purchase reference must match the purchase.')
         if self.purchase_id and self.provider_transaction_id != (self.purchase.provider_transaction_id or ''):
             raise ValidationError('Decision provider transaction ID must match the purchase.')
+        if self.purchase_id and self.provider_mode != self.purchase.provider_mode:
+            raise ValidationError('Decision provider environment must match the purchase.')
         if self.entitlement_id and self.user_id and self.entitlement.user_id != self.user_id:
             raise ValidationError('Decision user must match the entitlement user.')
         if self.state == self.EXECUTED and (
@@ -277,7 +328,7 @@ class EntitlementRestorationDecision(models.Model):
             previous = type(self).objects.get(pk=self.pk)
             immutable_fields = (
                 'decision_id', 'purchase_id', 'purchase_reference', 'entitlement_id', 'user_id',
-                'provider_transaction_id', 'approved_by_id', 'approved_by_identifier',
+                'provider_transaction_id', 'provider_mode', 'approved_by_id', 'approved_by_identifier',
                 'evidence_reference', 'reason', 'previous_status', 'approved_at',
             )
             if any(getattr(previous, field) != getattr(self, field) for field in immutable_fields):
@@ -304,6 +355,7 @@ class PaystackWebhookEvent(models.Model):
 
     deduplication_key = models.CharField(max_length=180, unique=True)
     event_type = models.CharField(max_length=80)
+    provider_mode = models.CharField(max_length=8, choices=PAYSTACK_MODES, null=True, default=current_paystack_mode, editable=False)
     transaction_reference = models.CharField(max_length=80, blank=True)
     payload_digest = models.CharField(max_length=64)
     processing_status = models.CharField(max_length=16, choices=PROCESSING_STATUSES, default=RECEIVED)
