@@ -1,4 +1,4 @@
-from datetime import datetime, timezone as datetime_timezone
+from datetime import datetime, timedelta, timezone as datetime_timezone
 import hashlib
 import hmac
 import importlib
@@ -122,6 +122,97 @@ class BillingModelTests(TestCase):
         self.assertTrue(Transaction.objects.filter(pk=transaction.pk).exists())
         account.refresh_from_db()
         self.assertEqual(str(account.current_balance), '-10.00')
+
+
+@override_settings(PAYSTACK_MODE='live')
+class PaymentReconciliationReportTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user('reconcile-user', 'reconcile@example.com', 'SafePassword123!')
+        self.offer = LifetimeAccessOffer.objects.create(
+            name='Reconciliation offer', price_minor=105000, currency='KES', is_active=True,
+        )
+
+    def attempt(self, mode='live', **overrides):
+        values = {
+            'user': self.user,
+            'offer': self.offer,
+            'expected_amount_minor': 105000,
+            'expected_currency': 'KES',
+            'provider_mode': mode,
+        }
+        values.update(overrides)
+        return PaystackPurchaseAttempt.objects.create(**values)
+
+    def entitlement(self, attempt, status_value):
+        return LifetimeAccessEntitlement.objects.create(
+            user=attempt.user,
+            source=LifetimeAccessEntitlement.PAYSTACK_PURCHASE,
+            activating_purchase=attempt,
+            provider_mode=attempt.provider_mode,
+            status=status_value,
+        )
+
+    def test_live_report_is_mode_scoped_and_lists_manual_findings_without_mutation(self):
+        missing = self.attempt(status=PaystackPurchaseAttempt.SUCCESSFUL)
+        suspended_user = User.objects.create_user('reconcile-suspended', 'reconcile-suspended@example.com', 'SafePassword123!')
+        suspended = self.attempt(user=suspended_user, status=PaystackPurchaseAttempt.SUCCESSFUL)
+        self.entitlement(suspended, LifetimeAccessEntitlement.CHARGEBACK_SUSPENDED)
+        refunded_user = User.objects.create_user('reconcile-refunded', 'reconcile-refunded@example.com', 'SafePassword123!')
+        refunded = self.attempt(user=refunded_user, status=PaystackPurchaseAttempt.SUCCESSFUL)
+        self.entitlement(refunded, LifetimeAccessEntitlement.REFUNDED)
+        deleted = self.attempt(status=PaystackPurchaseAttempt.SUCCESSFUL, user=None)
+        stale = self.attempt(status=PaystackPurchaseAttempt.PENDING)
+        PaystackPurchaseAttempt.objects.filter(pk=stale.pk).update(
+            created_at=timezone.now() - timedelta(minutes=61)
+        )
+        review = self.attempt(provider_metadata={
+            'refund_review_required': True,
+            'dispute_review_required': True,
+        })
+        test_attempt = self.attempt('test', status=PaystackPurchaseAttempt.SUCCESSFUL)
+        historical = self.attempt()
+        PaystackPurchaseAttempt.objects.filter(pk=historical.pk).update(provider_mode=None)
+        PaystackWebhookEvent.objects.create(
+            deduplication_key='live:charge.success:failed', event_type='charge.success',
+            provider_mode='live', transaction_reference=missing.reference,
+            payload_digest='a' * 64, processing_status=PaystackWebhookEvent.FAILED,
+            error_category='verification_failed',
+        )
+        PaystackWebhookEvent.objects.create(
+            deduplication_key='test:charge.success:failed', event_type='charge.success',
+            provider_mode='test', transaction_reference=test_attempt.reference,
+            payload_digest='b' * 64, processing_status=PaystackWebhookEvent.FAILED,
+            error_category='verification_failed',
+        )
+
+        output = StringIO()
+        call_command(
+            'payment_reconciliation_report', '--mode', 'live',
+            '--stale-after-minutes', '60', stdout=output,
+        )
+        report = output.getvalue()
+
+        self.assertIn('Requested provider mode: live', report)
+        self.assertIn('Configured Paystack mode: live', report)
+        self.assertIn(missing.reference, report)
+        self.assertIn(suspended.reference, report)
+        self.assertIn(refunded.reference, report)
+        self.assertIn(deleted.reference, report)
+        self.assertIn(stale.reference, report)
+        self.assertIn(review.reference, report)
+        self.assertIn(historical.reference, report)
+        self.assertIn('verification_failed: 1', report)
+        self.assertNotIn(test_attempt.reference, report)
+
+        missing.refresh_from_db()
+        self.assertEqual(missing.status, PaystackPurchaseAttempt.SUCCESSFUL)
+        self.assertFalse(LifetimeAccessEntitlement.objects.filter(activating_purchase=missing).exists())
+
+    def test_mode_is_required_and_stale_threshold_must_be_positive(self):
+        with self.assertRaises(CommandError):
+            call_command('payment_reconciliation_report')
+        with self.assertRaises(CommandError):
+            call_command('payment_reconciliation_report', '--mode', 'live', '--stale-after-minutes', '0')
 
 
 @override_settings(BILLING_ENFORCE_LIFETIME_ACCESS=True)
