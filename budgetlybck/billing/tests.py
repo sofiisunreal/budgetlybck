@@ -20,6 +20,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase, APIRequestFactory, force_authenticate
 
 from budget.models import Account, Category, Transaction
+from budgetlybck.settings import env_positive_int_set
 from .models import (LifetimeAccessEntitlement, LifetimeAccessOffer,
                      EntitlementRestorationDecision, PaystackPurchaseAttempt,
                      PaystackWebhookEvent)
@@ -290,7 +291,11 @@ class PaymentEnvironmentIsolationTests(APITestCase):
 
     def test_test_pending_attempt_does_not_block_live_checkout(self):
         self.attempt('test', status=PaystackPurchaseAttempt.PENDING)
-        with self.settings(**self.live_settings):
+        with self.settings(**{
+            **self.live_settings,
+            'BILLING_LIVE_CHECKOUT_ENABLED': True,
+            'BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS': frozenset({self.user.pk}),
+        }):
             with patch('billing.views.initialize_transaction') as initialize:
                 initialize.side_effect = lambda **kwargs: {
                     'reference': kwargs['reference'], 'authorization_url': 'https://checkout.example.test/live',
@@ -353,6 +358,114 @@ class PaymentEnvironmentIsolationTests(APITestCase):
             b'whsec_live_environment_test', f'{timestamp}.'.encode('ascii') + raw, hashlib.sha512,
         ).hexdigest()
         return raw, f't={timestamp},v1=whk_live:{digest}'
+
+
+@override_settings(
+    PAYSTACK_MODE='live',
+    PAYSTACK_LIVE_SECRET_KEY='sk_live_checkout_test',
+    PAYSTACK_LIVE_WEBHOOK_SIGNING_SECRET='whsec_live_checkout_test',
+    PAYSTACK_CALLBACK_URL='https://api.example.test/api/billing/paystack/callback/',
+    FRONTEND_PAYMENT_RETURN_URL='https://app.example.test/payment/complete',
+)
+class LiveCheckoutRestrictionTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user('live-checkout', 'live-checkout@example.com', 'SafePassword123!')
+        self.other_user = User.objects.create_user('other-live-checkout', 'other-live-checkout@example.com', 'SafePassword123!')
+        self.offer = LifetimeAccessOffer.objects.create(
+            name='Controlled live offer', price_minor=105000, currency='KES', is_active=True,
+        )
+        self.client.force_authenticate(self.user)
+
+    def assert_restricted(self, response):
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data, {
+            'detail': 'Live checkout is not available for this account.',
+            'code': 'live_checkout_restricted',
+        })
+
+    @patch('billing.views.initialize_transaction')
+    def test_disabled_live_checkout_rejects_before_paystack(self, initialize):
+        with self.settings(
+            BILLING_LIVE_CHECKOUT_ENABLED=False,
+            BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=frozenset({self.user.pk}),
+        ):
+            response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+        self.assert_restricted(response)
+        initialize.assert_not_called()
+        self.assertFalse(PaystackPurchaseAttempt.objects.exists())
+
+    @patch('billing.views.initialize_transaction')
+    def test_live_checkout_requires_authenticated_user_id_allowlist(self, initialize):
+        with self.settings(
+            BILLING_LIVE_CHECKOUT_ENABLED=True,
+            BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=frozenset({self.other_user.pk}),
+        ):
+            response = self.client.post('/api/billing/purchases/initialize/', {'email': self.other_user.email}, format='json')
+        self.assert_restricted(response)
+        initialize.assert_not_called()
+
+    @patch('billing.views.initialize_transaction')
+    def test_invalid_or_empty_allowlist_fails_closed(self, initialize):
+        for allowed_ids in (None, frozenset()):
+            with self.settings(
+                BILLING_LIVE_CHECKOUT_ENABLED=True,
+                BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=allowed_ids,
+            ):
+                response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+            self.assert_restricted(response)
+        initialize.assert_not_called()
+
+    def test_invalid_allowlist_values_are_rejected_by_settings_parser(self):
+        with patch.dict(os.environ, {'BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS': '5,not-an-id'}):
+            self.assertIsNone(env_positive_int_set('BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS'))
+        with patch.dict(os.environ, {'BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS': '0'}):
+            self.assertIsNone(env_positive_int_set('BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS'))
+
+    @patch('billing.views.initialize_transaction')
+    def test_authorized_live_user_can_initialize_checkout(self, initialize):
+        initialize.side_effect = lambda **kwargs: {
+            'reference': kwargs['reference'], 'authorization_url': 'https://checkout.example.test/live',
+        }
+        with self.settings(
+            BILLING_LIVE_CHECKOUT_ENABLED=True,
+            BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=frozenset({self.user.pk}),
+        ):
+            response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(PaystackPurchaseAttempt.objects.get().provider_mode, 'live')
+
+    @patch('billing.views.verify_and_activate_purchase')
+    def test_disabled_checkout_does_not_block_verification(self, verify):
+        attempt = PaystackPurchaseAttempt.objects.create(
+            user=self.user, offer=self.offer, expected_amount_minor=105000,
+            expected_currency='KES', provider_mode='live', status=PaystackPurchaseAttempt.PENDING,
+        )
+        verify.return_value = (attempt, None, False)
+        with self.settings(
+            BILLING_LIVE_CHECKOUT_ENABLED=False,
+            BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=frozenset(),
+        ):
+            response = self.client.post(f'/api/billing/purchases/{attempt.reference}/verify/', {}, format='json')
+        self.assertEqual(response.status_code, 200)
+        verify.assert_called_once_with(attempt.reference)
+
+    @patch('billing.views.initialize_transaction')
+    def test_test_mode_checkout_is_unaffected(self, initialize):
+        initialize.side_effect = lambda **kwargs: {
+            'reference': kwargs['reference'], 'authorization_url': 'https://checkout.example.test/test',
+        }
+        with self.settings(
+            PAYSTACK_MODE='test',
+            PAYSTACK_TEST_SECRET_KEY='sk_test_checkout_test',
+            PAYSTACK_TEST_WEBHOOK_SIGNING_SECRET='whsec_test_checkout_test',
+            PAYSTACK_CALLBACK_URL='http://localhost:8000/api/billing/paystack/callback/',
+            FRONTEND_PAYMENT_RETURN_URL='http://localhost:5173/payment/complete',
+            BILLING_LIVE_CHECKOUT_ENABLED=False,
+            BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS=None,
+        ):
+            response = self.client.post('/api/billing/purchases/initialize/', {}, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(PaystackPurchaseAttempt.objects.get().provider_mode, 'test')
 
 
 class PaymentEnvironmentMigrationTests(TestCase):

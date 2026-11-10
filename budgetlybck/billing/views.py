@@ -54,6 +54,18 @@ def access_data(user):
     return {'has_lifetime_access': active, 'entitlement_status': entitlement.status if entitlement else None, 'purchase_required': not active}
 
 
+def live_checkout_allowed(user):
+    """Fail closed unless this account is explicitly approved for Live checkout."""
+    if settings.PAYSTACK_MODE != 'live':
+        return True
+    allowed_ids = settings.BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS
+    return bool(
+        settings.BILLING_LIVE_CHECKOUT_ENABLED
+        and isinstance(allowed_ids, (set, frozenset))
+        and user.pk in allowed_ids
+    )
+
+
 class BillingAccessView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -65,6 +77,16 @@ class PurchaseInitializeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        # This is intentionally before all provider/configuration work.  It
+        # restricts only new Live checkout initialization, never verification.
+        if not live_checkout_allowed(request.user):
+            return Response(
+                {
+                    'detail': 'Live checkout is not available for this account.',
+                    'code': 'live_checkout_restricted',
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         if has_lifetime_access(request.user):
             return Response({'detail': 'This account already has lifetime access.'}, status=status.HTTP_409_CONFLICT)
         try:

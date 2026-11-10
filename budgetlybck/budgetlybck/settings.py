@@ -28,6 +28,16 @@ def env_list(name, default=''):
     return [value.strip() for value in os.getenv(name, default).split(',') if value.strip()]
 
 
+def env_positive_int_set(name):
+    """Return configured positive integer IDs, or None for invalid input."""
+    values = env_list(name)
+    try:
+        parsed = frozenset(int(value) for value in values)
+    except ValueError:
+        return None
+    return parsed if all(value > 0 for value in parsed) else None
+
+
 # Development defaults keep the current local workflow working. Production must
 # provide DJANGO_SECRET_KEY and set DJANGO_DEBUG=False through its environment.
 DEBUG = env_bool('DJANGO_DEBUG', True)
@@ -221,6 +231,10 @@ BILLING_LIFETIME_OFFER_NAME = os.getenv('BILLING_LIFETIME_OFFER_NAME', 'Budgetly
 # Phase 4 is deliberately deployable without changing present access. Set to
 # true only after founding-user grants and end-to-end payment testing finish.
 BILLING_ENFORCE_LIFETIME_ACCESS = env_bool('BILLING_ENFORCE_LIFETIME_ACCESS', False)
+# Live checkout remains closed until an operator enables it and names the
+# small set of users authorized for the controlled first payments.
+BILLING_LIVE_CHECKOUT_ENABLED = env_bool('BILLING_LIVE_CHECKOUT_ENABLED', False)
+BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS = env_positive_int_set('BILLING_LIVE_CHECKOUT_ALLOWED_USER_IDS')
 
 # Test and live credentials are intentionally distinct.  The legacy generic
 # variables remain a test-mode-only compatibility path while deployments move
