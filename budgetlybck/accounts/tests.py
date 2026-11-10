@@ -3,6 +3,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core.exceptions import ValidationError
 from django.core import mail
+from django.core.cache import cache
 from django.core.management import call_command, CommandError
 from django.test import override_settings
 from django.test import TransactionTestCase
@@ -33,6 +34,14 @@ User = get_user_model()
 
 class RegistrationLegalAcceptanceTests(APITestCase):
     url = "/api/auth/register/"
+
+    def setUp(self):
+        # Registration is publicly throttled; isolate legal-validation tests
+        # so prior test requests cannot consume this test's request budget.
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
 
     def payload(self, **overrides):
         data = {
