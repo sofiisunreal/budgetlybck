@@ -13,6 +13,7 @@ from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 from rest_framework.views import APIView
 
 from .models import (LifetimeAccessEntitlement, LifetimeAccessOffer,
@@ -29,10 +30,22 @@ from .services.paystack import (PaystackConfigurationError, PaystackError,
 logger = logging.getLogger(__name__)
 
 
+class BillingAccessThrottle(UserRateThrottle):
+    scope = 'billing_access'
+
+
+class BillingCheckoutThrottle(UserRateThrottle):
+    scope = 'billing_checkout'
+
+
+class BillingVerificationThrottle(UserRateThrottle):
+    scope = 'billing_verify'
+
+
 def active_offer():
     offer = LifetimeAccessOffer.objects.filter(is_active=True).first()
     if not offer or offer.currency != settings.BILLING_LIFETIME_CURRENCY or offer.price_minor != settings.BILLING_LIFETIME_PRICE_MINOR:
-        logger.error('Active billing offer unavailable or mismatched')
+        logger.error('billing_event=active_offer_invalid category=configuration')
         raise PaystackConfigurationError('Active billing offer is unavailable or mismatched.')
     return offer
 
@@ -68,6 +81,7 @@ def live_checkout_allowed(user):
 
 class BillingAccessView(APIView):
     permission_classes = [IsAuthenticated]
+    throttle_classes = [BillingAccessThrottle]
 
     def get(self, request):
         return Response(access_data(request.user))
@@ -75,6 +89,7 @@ class BillingAccessView(APIView):
 
 class PurchaseInitializeView(APIView):
     permission_classes = [IsAuthenticated]
+    throttle_classes = [BillingCheckoutThrottle]
 
     def post(self, request):
         # This is intentionally before all provider/configuration work.  It
@@ -125,7 +140,11 @@ class PurchaseInitializeView(APIView):
                 else PaystackPurchaseAttempt.FAILED
             )
             attempt.save(update_fields=['status', 'updated_at'])
-            logger.warning('Paystack initialization failed', extra={'reference': attempt.reference, 'category': error.category})
+            logger.warning(
+                'billing_event=initialization_failed category=%s reference=%s',
+                error.category,
+                attempt.reference,
+            )
             return Response({'detail': 'Unable to start checkout. Please try again.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         attempt.initialized_at = timezone.now()
@@ -147,6 +166,8 @@ class PurchaseDetailView(APIView):
 
 
 class PurchaseVerifyView(PurchaseDetailView):
+    throttle_classes = [BillingVerificationThrottle]
+
     def post(self, request, reference):
         self.get_object(request, reference)
         try:
@@ -194,7 +215,7 @@ class PaystackCallbackView(APIView):
                 attempt, entitlement, _ = verify_and_activate_purchase(reference)
                 outcome = 'success' if entitlement and entitlement.status == LifetimeAccessEntitlement.ACTIVE else attempt.status
             except (PaystackError, PurchaseVerificationError, PaystackPurchaseAttempt.DoesNotExist):
-                logger.info('Paystack callback verification incomplete', extra={'reference': reference})
+                logger.info('billing_event=callback_verification_incomplete reference=%s', reference)
         try:
             return HttpResponseRedirect(payment_return_url(reference, outcome))
         except PaystackConfigurationError:
@@ -208,6 +229,7 @@ class PaystackWebhookView(APIView):
     def post(self, request):
         raw_body = request.body
         if not webhook_signature_valid(raw_body, request.headers):
+            logger.warning('billing_event=webhook_signature_rejected')
             return Response({'detail': 'Invalid webhook signature.'}, status=status.HTTP_401_UNAUTHORIZED)
         try:
             event = json.loads(raw_body.decode('utf-8'))
@@ -215,6 +237,7 @@ class PaystackWebhookView(APIView):
             if not isinstance(data, dict):
                 raise ValueError
         except (UnicodeDecodeError, ValueError, TypeError, KeyError):
+            logger.warning('billing_event=webhook_payload_rejected')
             return Response({'detail': 'Invalid webhook payload.'}, status=status.HTTP_400_BAD_REQUEST)
 
         reference, provider_id = event_transaction_reference(data), str(data.get('id') or '')
@@ -249,10 +272,18 @@ class PaystackWebhookView(APIView):
         except PaystackUnavailableError:
             webhook_event.processing_status, webhook_event.error_category = PaystackWebhookEvent.FAILED, 'provider_unavailable'
             webhook_event.save(update_fields=['processing_status', 'error_category'])
+            logger.warning(
+                'billing_event=webhook_processing_failed category=provider_unavailable reference=%s',
+                reference or '-',
+            )
             return Response({'detail': 'Temporary processing failure.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except (PaystackError, PurchaseVerificationError, PaystackPurchaseAttempt.DoesNotExist, DjangoValidationError):
             webhook_event.processing_status, webhook_event.error_category = PaystackWebhookEvent.FAILED, 'verification_failed'
             webhook_event.save(update_fields=['processing_status', 'error_category'])
+            logger.warning(
+                'billing_event=webhook_processing_failed category=verification_failed reference=%s',
+                reference or '-',
+            )
             return Response(status=status.HTTP_200_OK)
         webhook_event.processing_status, webhook_event.processed_at, webhook_event.error_category = PaystackWebhookEvent.PROCESSED, timezone.now(), ''
         webhook_event.save(update_fields=['processing_status', 'processed_at', 'error_category'])

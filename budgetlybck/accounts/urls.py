@@ -4,13 +4,10 @@ from .views import (ActivePolicyDocumentsView, ChangePasswordView,
                     DeleteAccountView, ForgotPasswordView,
                     GoogleAuthenticationView, GoogleIdentityLinkView,
                     LegalAcceptanceStatusView, LogoutView,
-                    PolicyAcceptanceView, ProfileView, RegisterView,
+                    LoginView, PolicyAcceptanceView, ProfileView, RegisterView,
                     ResetPasswordView)
 
-from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
-    TokenRefreshView,
-)
+from rest_framework_simplejwt.views import TokenRefreshView
 
 
 urlpatterns = [
@@ -20,7 +17,7 @@ urlpatterns = [
     path('register/', RegisterView.as_view(), name='register'),
     path('google/', GoogleAuthenticationView.as_view(), name='google-authentication'),
     path('google/link/', GoogleIdentityLinkView.as_view(), name='google-identity-link'),
-    path('login/', TokenObtainPairView.as_view(), name='login'),
+    path('login/', LoginView.as_view(), name='login'),
     path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('profile/', ProfileView.as_view(), name='profile'),
     path('logout/', LogoutView.as_view(), name='logout'),

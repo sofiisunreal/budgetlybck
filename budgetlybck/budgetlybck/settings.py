@@ -189,6 +189,13 @@ REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'] = {
     'feedback': os.getenv('DJANGO_FEEDBACK_THROTTLE_RATE', '5/hour'),
     'google_auth': os.getenv('DJANGO_GOOGLE_AUTH_THROTTLE_RATE', '10/minute'),
     'google_link': os.getenv('DJANGO_GOOGLE_LINK_THROTTLE_RATE', '10/minute'),
+    'login': os.getenv('DJANGO_LOGIN_THROTTLE_RATE', '10/minute'),
+    'registration': os.getenv('DJANGO_REGISTRATION_THROTTLE_RATE', '5/hour'),
+    'forgot_password': os.getenv('DJANGO_FORGOT_PASSWORD_THROTTLE_RATE', '5/hour'),
+    'reset_password': os.getenv('DJANGO_RESET_PASSWORD_THROTTLE_RATE', '10/hour'),
+    'billing_checkout': os.getenv('DJANGO_BILLING_CHECKOUT_THROTTLE_RATE', '10/hour'),
+    'billing_verify': os.getenv('DJANGO_BILLING_VERIFY_THROTTLE_RATE', '30/hour'),
+    'billing_access': os.getenv('DJANGO_BILLING_ACCESS_THROTTLE_RATE', '120/hour'),
 }
 
 
@@ -272,6 +279,29 @@ if not DEBUG:
     CSRF_COOKIE_SECURE = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
     X_FRAME_OPTIONS = 'DENY'
+
+
+# AlwaysData captures process output; bounded retention/rotation is managed by
+# the hosting platform rather than writing unbounded application log files.
+# The formatter deliberately excludes request bodies and headers.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'filters': {
+        'sensitive_data': {'()': 'budgetlybck.logging_filters.SensitiveDataFilter'},
+    },
+    'formatters': {
+        'safe': {'format': '%(asctime)s %(levelname)s %(name)s %(message)s'},
+    },
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler', 'formatter': 'safe', 'filters': ['sensitive_data']},
+    },
+    'loggers': {
+        'billing': {'handlers': ['console'], 'level': os.getenv('DJANGO_BILLING_LOG_LEVEL', 'INFO'), 'propagate': False},
+        'accounts': {'handlers': ['console'], 'level': os.getenv('DJANGO_ACCOUNTS_LOG_LEVEL', 'WARNING'), 'propagate': False},
+        'django.request': {'handlers': ['console'], 'level': 'ERROR', 'propagate': False},
+    },
+}
 
 
 

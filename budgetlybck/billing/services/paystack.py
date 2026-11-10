@@ -89,21 +89,41 @@ def _request(method, path, *, payload=None, expected_data_type=dict):
             timeout=(settings.PAYSTACK_CONNECT_TIMEOUT_SECONDS, settings.PAYSTACK_READ_TIMEOUT_SECONDS),
         )
     except (requests.ConnectionError, requests.Timeout) as error:
-        logger.warning('Paystack request unavailable', extra={'operation': path, 'category': type(error).__name__})
+        logger.warning(
+            'billing_event=provider_request_unavailable operation=%s category=%s',
+            path,
+            type(error).__name__,
+        )
         raise PaystackUnavailableError('Paystack is temporarily unavailable.') from error
     except requests.RequestException as error:
-        logger.warning('Paystack request failed', extra={'operation': path, 'category': type(error).__name__})
+        logger.warning(
+            'billing_event=provider_request_failed operation=%s category=%s',
+            path,
+            type(error).__name__,
+        )
         raise PaystackUnavailableError('Paystack is temporarily unavailable.') from error
     if response.status_code >= 500 or response.status_code == 429:
-        logger.warning('Paystack service unavailable', extra={'operation': path, 'status_code': response.status_code})
+        logger.warning(
+            'billing_event=provider_service_unavailable operation=%s status_code=%s',
+            path,
+            response.status_code,
+        )
         raise PaystackUnavailableError('Paystack is temporarily unavailable.')
     try:
         body = response.json()
     except ValueError as error:
-        logger.warning('Paystack returned malformed JSON', extra={'operation': path, 'status_code': response.status_code})
+        logger.warning(
+            'billing_event=provider_malformed_response operation=%s status_code=%s',
+            path,
+            response.status_code,
+        )
         raise PaystackResponseError('Paystack returned an invalid response.') from error
     if not response.ok or body.get('status') is not True or not isinstance(body.get('data'), expected_data_type):
-        logger.warning('Paystack rejected request', extra={'operation': path, 'status_code': response.status_code})
+        logger.warning(
+            'billing_event=provider_rejected_request operation=%s status_code=%s',
+            path,
+            response.status_code,
+        )
         raise PaystackResponseError('Paystack could not process the request.')
     return body['data']
 

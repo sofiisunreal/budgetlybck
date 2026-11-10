@@ -7,6 +7,7 @@ from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .serializers import (ChangePasswordSerializer, DeleteAccountSerializer,
                           ForgotPasswordSerializer, PolicyAcceptanceSerializer,
@@ -46,6 +47,28 @@ class GoogleLinkThrottle(UserRateThrottle):
     scope = 'google_link'
 
 
+class LoginThrottle(AnonRateThrottle):
+    scope = 'login'
+
+
+class RegistrationThrottle(AnonRateThrottle):
+    scope = 'registration'
+
+
+class ForgotPasswordThrottle(AnonRateThrottle):
+    scope = 'forgot_password'
+
+
+class ResetPasswordThrottle(AnonRateThrottle):
+    scope = 'reset_password'
+
+
+class LoginView(TokenObtainPairView):
+    """Use the existing JWT login endpoint with a request-rate guard."""
+
+    throttle_classes = [LoginThrottle]
+
+
 def active_policy_documents_response():
     """Return active documents or a safe, explicit unavailable response."""
     try:
@@ -83,11 +106,14 @@ def send_welcome_email(user):
         message.attach_alternative(render_to_string('accounts/emails/welcome.html', context), 'text/html')
         message.send(fail_silently=False)
     except Exception:
-        logger.exception('Welcome email delivery failed')
+        # SMTP exceptions can include recipient/provider details. Keep the
+        # operational signal without retaining that data in shared logs.
+        logger.error('Welcome email delivery failed category=email_delivery')
 
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
+    throttle_classes = [RegistrationThrottle]
 
     def create(self, request, *args, **kwargs):
         if active_policy_documents_response() is None:
@@ -302,6 +328,7 @@ class ChangePasswordView(generics.GenericAPIView):
 class ForgotPasswordView(generics.GenericAPIView):
     serializer_class = ForgotPasswordSerializer
     permission_classes = [AllowAny]
+    throttle_classes = [ForgotPasswordThrottle]
 
     def post(self, request):
         serializer = self.get_serializer(data=request.data)
@@ -343,7 +370,7 @@ class ForgotPasswordView(generics.GenericAPIView):
             message.send(fail_silently=False)
 
         except Exception:
-            logger.exception("Password reset email delivery failed")
+            logger.error('Password reset email delivery failed category=email_delivery')
             return Response(
                 {
                     'message': 'Unable to process the password reset request right now.'
@@ -358,6 +385,7 @@ class ForgotPasswordView(generics.GenericAPIView):
 class ResetPasswordView(generics.GenericAPIView):
     serializer_class = ResetPasswordSerializer
     permission_classes = [AllowAny]
+    throttle_classes = [ResetPasswordThrottle]
 
     def post(self, request, uid, token):
         serializer = self.get_serializer(data=request.data)
@@ -414,7 +442,7 @@ class DeleteAccountView(generics.GenericAPIView):
                 status=409,
             )
         except Exception:
-            logger.exception('Account deletion failed')
+            logger.error('Account deletion failed category=deletion_error')
             return Response(
                 {'detail': 'Account deletion could not be completed. No records were deleted.'},
                 status=500,
