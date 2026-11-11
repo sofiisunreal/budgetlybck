@@ -555,7 +555,7 @@ class PasswordResetTests(APITestCase):
 
 @override_settings(
     EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
-    FRONTEND_APP_URL="https://app.example.test",
+    FRONTEND_APP_URL="https://budgetlyke.com",
 )
 class WelcomeEmailTests(TransactionTestCase):
     def setUp(self):
@@ -581,9 +581,20 @@ class WelcomeEmailTests(TransactionTestCase):
         self.assertEqual(len(mail.outbox), 1)
         message = mail.outbox[0]
         self.assertEqual(message.subject, "Welcome to Budgetly. Let's make money simpler.")
-        self.assertIn("https://app.example.test", message.body)
+        self.assertIn("https://budgetlyke.com", message.body)
         self.assertEqual(message.alternatives[0][1], "text/html")
         self.assertIn("Money stuff, a little less complicated.", message.alternatives[0][0])
+        self.assertIn('href="https://budgetlyke.com"', message.alternatives[0][0])
+
+    def test_welcome_email_uses_localhost_only_when_configured_for_development(self):
+        user = User.objects.create_user("local-welcome", "local-welcome@example.com", "SafePassword123!")
+
+        with self.settings(FRONTEND_APP_URL="http://localhost:5173"):
+            send_welcome_email(user)
+
+        message = mail.outbox[0]
+        self.assertIn("http://localhost:5173", message.body)
+        self.assertIn('href="http://localhost:5173"', message.alternatives[0][0])
 
     def test_duplicate_registration_does_not_send_a_second_welcome_email(self):
         self.assertEqual(self.register().status_code, status.HTTP_201_CREATED)

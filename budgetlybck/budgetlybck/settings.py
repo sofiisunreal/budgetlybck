@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
@@ -239,7 +240,22 @@ LEGAL_POLICY_VERSION = os.getenv('DJANGO_LEGAL_POLICY_VERSION', '1.0')
 FRONTEND_PASSWORD_RESET_URL = os.getenv(
     'DJANGO_FRONTEND_PASSWORD_RESET_URL', 'http://localhost:5173/reset-password'
 )
-FRONTEND_APP_URL = os.getenv('DJANGO_FRONTEND_APP_URL', 'http://localhost:5173')
+_configured_frontend_app_url = os.getenv('DJANGO_FRONTEND_APP_URL', '').rstrip('/')
+if not _configured_frontend_app_url:
+    if DEBUG:
+        FRONTEND_APP_URL = 'http://localhost:5173'
+    else:
+        raise ImproperlyConfigured(
+            'DJANGO_FRONTEND_APP_URL is required when DJANGO_DEBUG is False.'
+        )
+else:
+    FRONTEND_APP_URL = _configured_frontend_app_url
+
+_frontend_app_url_parts = urlparse(FRONTEND_APP_URL)
+if _frontend_app_url_parts.scheme not in {'http', 'https'} or not _frontend_app_url_parts.netloc:
+    raise ImproperlyConfigured('DJANGO_FRONTEND_APP_URL must be an absolute HTTP(S) URL.')
+if not DEBUG and _frontend_app_url_parts.scheme != 'https':
+    raise ImproperlyConfigured('DJANGO_FRONTEND_APP_URL must use HTTPS when DJANGO_DEBUG is False.')
 
 # Comma-separated OAuth 2.0 Web client IDs allowed to present Google ID tokens.
 # Credentials and client secrets are never used by this ID-token-only flow.
