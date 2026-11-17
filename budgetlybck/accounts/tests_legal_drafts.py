@@ -9,6 +9,32 @@ from .models import PolicyDocument
 
 
 class LegalDocumentDraftTests(TestCase):
+    def test_v13_pair_replaces_only_the_support_address_and_validates_inactive(self):
+        drafts = Path(settings.BASE_DIR) / 'legal_documents' / 'drafts'
+        terms = (drafts / 'terms-of-service-v1.3.md').read_text(encoding='utf-8')
+        privacy = (drafts / 'privacy-policy-v1.3.md').read_text(encoding='utf-8')
+        output = StringIO()
+
+        self.assertEqual((terms + privacy).count('support@budgetlyke.com'), 8)
+        self.assertNotIn('budgetly01@gmail.com', terms + privacy)
+        self.assertIn('KES 1,050, paid once through Paystack', terms)
+        self.assertIn('as long as Budgetly continues to make the service available', terms)
+        self.assertIn('Google Sign-In', privacy)
+        self.assertIn('payment-reconciliation evidence with the deleted account link removed', privacy)
+
+        call_command(
+            'publish_policy_documents',
+            '--terms-file', str(drafts / 'terms-of-service-v1.3.md'),
+            '--privacy-file', str(drafts / 'privacy-policy-v1.3.md'),
+            '--policy-version', '1.3',
+            '--effective-at', '2026-11-16T21:00:00Z',
+            '--dry-run',
+            stdout=output,
+        )
+
+        self.assertIn('Would Import Terms and Privacy version 1.3', output.getvalue())
+        self.assertFalse(PolicyDocument.objects.filter(version='1.3').exists())
+
     def test_v12_pair_uses_today_effective_timestamp_without_writing_records(self):
         drafts = Path(settings.BASE_DIR) / 'legal_documents' / 'drafts'
         output = StringIO()
